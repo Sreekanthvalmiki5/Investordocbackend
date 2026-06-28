@@ -62,6 +62,17 @@ class User(Base):
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
     )
+    role: Mapped[str] = mapped_column(
+        String(20),
+        default="user",
+        nullable=False,
+    )
+
+    plan: Mapped[str] = mapped_column(
+        String(20),
+        default="free",
+        nullable=False,
+    )
 
     # Relationships
     conversations: Mapped[List["Conversation"]] = relationship(
@@ -73,6 +84,7 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email})>"

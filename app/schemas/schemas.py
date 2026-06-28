@@ -5,6 +5,8 @@ Request and response models with validation.
 
 from datetime import datetime
 from typing import Any, List, Optional
+from uuid import UUID
+
 
 from pydantic import BaseModel, EmailStr, Field, validator
 
@@ -19,6 +21,8 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
+    user:"UserResponse"
+    
 
 
 class LoginRequest(BaseModel):
@@ -75,10 +79,12 @@ class UserUpdate(BaseModel):
 class UserResponse(UserBase):
     """User response schema."""
 
-    id: str
+    id: UUID
     auth_provider: str
     created_at: datetime
     updated_at: datetime
+    role:str
+    plan:str
 
     class Config:
         from_attributes = True
@@ -401,3 +407,11 @@ class ErrorResponse(BaseModel):
 
     success: bool = False
     message: str
+    
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str = Field(..., min_length=8)

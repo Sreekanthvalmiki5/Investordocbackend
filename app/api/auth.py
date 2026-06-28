@@ -18,6 +18,8 @@ from app.schemas.schemas import (
     RegisterRequest,
     TokenResponse,
     UserResponse,
+    ForgotPasswordRequest,
+    ResetPasswordRequest
 )
 from app.services.services import AuthService
 
@@ -42,6 +44,7 @@ async def register(
                 access_token=token,
                 token_type="bearer",
                 expires_in=1440,
+                user=UserResponse.model_validate(user),
             ),
         )
     except ValueError as e:
@@ -60,6 +63,7 @@ async def login(
     try:
         service = AuthService(session)
         user, token = await service.login(request)
+        
 
         return AuthResponse(
             success=True,
@@ -68,6 +72,7 @@ async def login(
                 access_token=token,
                 token_type="bearer",
                 expires_in=1440,
+                user=UserResponse.model_validate(user),
             ),
         )
     except ValueError as e:
@@ -120,4 +125,34 @@ async def logout():
     return {
         "success": True,
         "message": "Logout successful",
+    }
+@router.post("/forgot-password")
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    service = AuthService(session)
+
+    await service.request_password_reset(request.email)
+
+    return {
+        "success": True,
+        "message": "If an account exists, a password reset link has been sent."
+    }
+    
+@router.post("/reset-password")
+async def reset_password(
+    request: ResetPasswordRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    service = AuthService(session)
+
+    await service.reset_password(
+        request.token,
+        request.password,
+    )
+
+    return {
+        "success": True,
+        "message": "Password updated successfully."
     }

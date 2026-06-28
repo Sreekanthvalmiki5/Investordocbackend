@@ -2,12 +2,13 @@
 Service Layer
 Business logic layer with repository injection.
 """
-
+import secrets
 import uuid
 from datetime import datetime
 from typing import List, Optional, Tuple
-
+from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.password_reset import PasswordResetToken
 
 from app.models.insight import AIInsight
 from app.models.bookmark import  Bookmark
@@ -17,6 +18,8 @@ from app.models.document import Document
 from app.models.message import Message
 from app.models.message import MessageSource
 from app.models.user import  User
+from app.services.email_service import EmailService
+from app.core.config import settings
 
 from app.repositories.repositories import (
     AIInsightRepository,
@@ -27,6 +30,7 @@ from app.repositories.repositories import (
     MessageRepository,
     MessageSourceRepository,
     UserRepository,
+    PasswordResetRepository
 )
 from app.schemas.schemas import (
     ChatRequest,
@@ -38,6 +42,7 @@ from app.schemas.schemas import (
     MessageCreate,
     RegisterRequest,
     UserUpdate,
+    ResetPasswordRequest
 )
 from app.core.security import create_access_token, hash_password, verify_password
 
@@ -48,17 +53,22 @@ class AuthService:
     def __init__(self, session: AsyncSession):
         self.user_repo = UserRepository(session)
         self.session = session
+        self.reset_repo = PasswordResetRepository(session)
+        self.email_service = EmailService()
 
     async def register(self, request: RegisterRequest) -> User:
         """Register a new user."""
         # Check if user exists
         existing = await self.user_repo.get_by_email(request.email)
+        print("Existing user:", existing) 
         if existing:
-            raise ValueError("User already exists")
+            raise ValueError(
+        "An account with this email already exists. Please sign in or reset your password."
+    )
 
         # Create user
         user = User(
-            id=str(uuid.uuid4()),
+          
             email=request.email,
             password_hash=hash_password(request.password),
             first_name=request.first_name,
@@ -80,6 +90,65 @@ class AuthService:
     async def get_current_user(self, user_id: str) -> Optional[User]:
         """Get user by ID."""
         return await self.user_repo.get_by_id(user_id)
+    async def request_password_reset(self,email: str,):
+
+        user = await self.user_repo.get_by_email(email)
+
+        # Never reveal whether the account exists
+        if not user:
+            return
+
+        # Remove previous reset links
+        await self.reset_repo.delete_user_tokens(user.id)
+
+        token = secrets.token_urlsafe(32)
+
+        expires = datetime.utcnow() + timedelta(minutes=30)
+
+        reset = PasswordResetToken(
+            user_id=user.id,
+            token=token,
+            expires_at=expires,
+        )
+
+        await self.reset_repo.create(reset)
+
+        reset_link = (
+            f"{settings.FRONTEND_URL}/#/reset-password?token={token}"
+        )
+
+        await self.email_service.send_password_reset(
+            email=user.email,
+            first_name=user.first_name or "User",
+            reset_link=reset_link,
+        )
+    # Later replace this with Resend/SendGrid
+    async def reset_password(
+                            self,
+                            token: str,
+                            new_password: str,
+                        ):
+
+        reset_token = await self.reset_repo.get_by_token(token)
+
+        if not reset_token:
+            raise ValueError("Invalid reset token.")
+
+        if reset_token.expires_at < datetime.utcnow():
+            raise ValueError("Reset token has expired.")
+
+        user = await self.user_repo.get_by_id(
+            reset_token.user_id
+        )
+
+        if not user:
+            raise ValueError("User not found.")
+
+        user.password_hash = hash_password(new_password)
+
+        await self.session.commit()
+
+        await self.reset_repo.delete(reset_token)
 
 
 class UserService:

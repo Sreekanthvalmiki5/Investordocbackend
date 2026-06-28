@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     QDRANT_URL: str = "http://localhost:6333"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSION: int = 1536
+    SMTP_SERVER: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_PASSWORD: str = ""
+    SMTP_EMAIL: str = ""
+    FRONTEND_URL:str
 
     class Config:
         env_file = ".env"

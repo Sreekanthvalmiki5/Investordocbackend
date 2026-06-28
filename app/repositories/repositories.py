@@ -5,7 +5,7 @@ Data access layer with SQLAlchemy async queries.
 
 from typing import List, Optional, Tuple
 
-from sqlalchemy import select, func, or_
+from sqlalchemy import select,delete, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
@@ -16,6 +16,10 @@ from app.models.document import Document
 from app.models.insight import AIInsight
 from app.models.message import Message, MessageSource
 from app.models.user import User
+
+
+from app.models.password_reset import PasswordResetToken
+
 
 
 class UserRepository:
@@ -499,3 +503,32 @@ class AIInsightRepository:
         stmt = select(AIInsight).where(AIInsight.id == insight_id)
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+class PasswordResetRepository:
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def create(self, token: PasswordResetToken):
+        self.session.add(token)
+        await self.session.commit()
+        await self.session.refresh(token)
+        return token
+
+    async def get_by_token(self, token: str):
+        
+        result = await self.session.execute(
+            select(PasswordResetToken)
+            .where(PasswordResetToken.token == token)
+        )
+        return result.scalar_one_or_none()
+
+    async def delete(self, token: PasswordResetToken):
+        await self.session.delete(token)
+        await self.session.commit()
+
+    async def delete_user_tokens(self, user_id):
+        await self.session.execute(
+            delete(PasswordResetToken)
+            .where(PasswordResetToken.user_id == user_id)
+        )
+        await self.session.commit()
