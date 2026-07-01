@@ -55,3 +55,5 @@ def setup_logging():
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
     logging.getLogger("fastapi").setLevel(logging.INFO)
     logging.getLogger("uvicorn").setLevel(logging.INFO)
+    # Silence passlib bcrypt compatibility warnings (harmless AttributeError in modern bcrypt versions)
+    logging.getLogger("passlib.handlers.bcrypt").setLevel(logging.ERROR)

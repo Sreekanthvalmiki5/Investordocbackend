@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api"
 
     # Database
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/investordocs"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:Welcome123!@localhost:5432/InvestorDocs"
     SQLALCHEMY_ECHO: bool = False
 
     # JWT
