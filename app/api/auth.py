@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Header, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
-from app.core.security import decode_token
+from app.core.security import decode_token, create_access_token
 from app.models.user import User
 from app.schemas.schemas import (
     AuthResponse,
@@ -35,7 +35,7 @@ async def register(
     try:
         service = AuthService(session)
         user = await service.register(request)
-        token = "temporary_token"  # Will be generated properly
+        token = create_access_token(user.id)
 
         return AuthResponse(
             success=True,

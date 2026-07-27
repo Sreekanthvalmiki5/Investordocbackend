@@ -11,6 +11,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from uuid import UUID
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 
 class Conversation(Base):
@@ -23,8 +25,8 @@ class Conversation(Base):
         primary_key=True,
     )
 
-    user_id: Mapped[str] = mapped_column(
-        String(100),
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
         ForeignKey("users.id"),
         nullable=False,
         index=True,

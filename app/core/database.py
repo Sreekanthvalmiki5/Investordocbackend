@@ -23,6 +23,7 @@ engine = create_async_engine(
     poolclass=pool.AsyncAdaptedQueuePool,
     pool_size=20,
     max_overflow=30,
+    connect_args={"server_settings": {"jit": "off"}},
 )
 
 # Create async session factory

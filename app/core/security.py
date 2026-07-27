@@ -66,24 +66,21 @@ def create_access_token(
 
 
 def decode_token(token: str) -> Optional[str]:
-    """
-    Decode a JWT token and extract the subject (user ID).
-    
-    Args:
-        token: JWT token to decode
-        
-    Returns:
-        Subject (user ID) if valid, None otherwise
-    """
     try:
+        print("JWT_SECRET_KEY:", settings.JWT_SECRET_KEY)
+        print("JWT_ALGORITHM:", settings.JWT_ALGORITHM)
+        print("TOKEN:", token)
+
         payload = jwt.decode(
             token,
             settings.JWT_SECRET_KEY,
             algorithms=[settings.JWT_ALGORITHM],
         )
-        subject: str = payload.get("sub")
-        if subject is None:
-            return None
-        return subject
-    except JWTError:
+
+        print("PAYLOAD:", payload)
+
+        return payload.get("sub")
+
+    except JWTError as e:
+        print("JWT ERROR:", repr(e))
         return None

@@ -224,6 +224,12 @@ class DocumentRepository:
         await self.session.refresh(document)
         return document
 
+    async def get_documents_without_chunks(self, limit: int = 50) -> List[Document]:
+        """Get documents that have no RAG chunks yet."""
+        stmt = select(Document).where(~Document.rag_chunks.any()).limit(limit)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def update(self, doc_id: str, **kwargs) -> Optional[Document]:
         """Update document fields."""
         document = await self.get_by_id(doc_id)
@@ -244,6 +250,44 @@ class DocumentRepository:
         await self.session.delete(document)
         await self.session.commit()
         return True
+    async def filter_documents(
+    self,
+    skip: int,
+    limit: int,
+    search: str | None = None,
+    company_id: str |None = None,
+    report_type: str |None = None,
+    year: int |None = None,
+    quarter: str |None = None,
+):
+
+        stmt = select(Document)
+
+        if search:
+            stmt = stmt.where(Document.name.ilike(f"%{search}%"))
+
+        if company_id:
+            stmt = stmt.where(Document.company_id == company_id)
+
+        if report_type:
+            stmt = stmt.where(Document.type == report_type)
+
+        if year:
+            stmt = stmt.where(Document.year == year)
+
+        if quarter:
+            stmt = stmt.where(Document.quarter == quarter)
+
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+
+        total = await self.session.scalar(count_stmt)
+
+        stmt = stmt.offset(skip).limit(limit)
+
+        result = await self.session.execute(stmt)
+
+        return result.scalars().all(), total
+        
 
 
 class ConversationRepository:

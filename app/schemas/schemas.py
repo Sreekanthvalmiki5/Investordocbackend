@@ -133,6 +133,22 @@ class CompanyListResponse(BaseModel):
     limit: int
     total: int
     items: List[CompanyResponse]
+class CompanyCreate(BaseModel):
+    name: str
+    ticker: Optional[str] = None
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    market_cap_cr: Optional[int] = 0
+    description: Optional[str] = None
+    color: Optional[str] = "#2563EB"
+class CompanyUpdate(BaseModel):
+    name: Optional[str] = None
+    ticker: Optional[str] = None
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    market_cap_cr: Optional[int] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
 
 
 # ============================================================================
@@ -262,7 +278,8 @@ class MessageBase(BaseModel):
 class MessageCreate(MessageBase):
     """Message creation schema."""
 
-    role: str = Field(..., pattern="^(user|assistant)$")
+    # Make role optional with a sensible default so clients that omit it still work.
+    role: str = Field("user", pattern="^(user|assistant|system)$")
     model: Optional[str] = None
 
 
@@ -379,8 +396,25 @@ class ChatRequest(BaseModel):
 
     message: str = Field(..., min_length=1, max_length=5000)
     company_id: Optional[str] = None
-    model: Optional[str] = "gpt-4"
+    model: Optional[str] = "openai/gpt-4o"
     conversation_id: Optional[str] = None
+
+    @validator("conversation_id", pre=True, always=True)
+    def normalize_conversation_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned in {"", "undefined", "null", "none"}:
+                return None
+        return value
+
+
+class RAGChatResponse(BaseModel):
+    """RAG chat response schema."""
+
+    conversation_id: str
+    content: str
 
 
 class ChatResponse(BaseModel):

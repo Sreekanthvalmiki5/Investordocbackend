@@ -45,9 +45,22 @@ class Settings(BaseSettings):
     # AI/RAG (Future)
     OPENAI_API_KEY: str = ""
     OPENROUTER_API_KEY: str = ""
+    OPENROUTER_API_BASE: str = "https://api.openrouter.ai/v1"
     QDRANT_URL: str = "http://localhost:6333"
+
+    # Vector store (PGVector)
+    VECTOR_DB_URL: str = "postgresql+psycopg://postgres:postgres@localhost:5432/investordocs"
+    VECTOR_COLLECTION_NAME: str = "investordocs"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSION: int = 1536
+
+    # AWS / S3
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_ACCESS_KEY: str = ""
+    AWS_SECRET_KEY: str = ""
+    AWS_REGION: str = "us-east-1"
+    AWS_BUCKET_NAME: str = ""
     SMTP_SERVER: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
     SMTP_PASSWORD: str = ""
@@ -57,6 +70,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"
 
 
 settings = Settings()

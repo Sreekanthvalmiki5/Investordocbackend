@@ -1,7 +1,11 @@
 """
 Chat Routes
 POST /api/chat
+
+Uses the production RAG pipeline for AI-powered financial document analysis.
 """
+
+import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,8 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_session
 from app.core.security import decode_token
 from app.models import User
-from app.schemas.schemas import ChatRequest, ChatResponse, MessageResponse
+from app.schemas.schemas import ChatRequest, RAGChatResponse
 from app.services.services import ChatService, UserService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -47,34 +53,35 @@ async def get_current_user_from_header(
     return user
 
 
-@router.post("", response_model=ChatResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=RAGChatResponse, status_code=status.HTTP_201_CREATED)
 async def chat(
     request: ChatRequest,
     current_user: User = Depends(get_current_user_from_header),
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Process chat message and return AI response.
-    
-    - **message**: User's question/message
-    - **company_id**: Optional company context
-    - **model**: LLM model to use (gpt-4, claude-3, etc)
-    - **conversation_id**: Optional - continue existing conversation
-    
-    Response includes:
-    - The assistant's message with citations/sources
-    - Conversation ID (new or existing)
+    Process chat message using the RAG pipeline.
+
+    Args:
+        request.message: User's question about financial documents
+        request.company_id: Optional company context for scoping search
+        request.model: LLM model (default: openai/gpt-4o)
+        request.conversation_id: Optional existing conversation to continue
+
+    Returns:
+        {
+            "conversation_id": "...",
+            "content": "...AI answer with markdown formatting and citations..."
+        }
     """
     try:
         service = ChatService(session)
-        message = await service.chat(current_user.id, request)
+        result = await service.chat(current_user.id, request)
 
-        return ChatResponse(
-            success=True,
-            message="Chat message processed successfully",
-            data=MessageResponse.from_orm(message),
-        )
+        return result
+
     except Exception as e:
+        logger.exception("Error processing chat request")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing chat: {str(e)}",

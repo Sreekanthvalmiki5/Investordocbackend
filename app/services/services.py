@@ -2,21 +2,34 @@
 Service Layer
 Business logic layer with repository injection.
 """
+
+import asyncio
+import httpx
 import secrets
 import uuid
 from datetime import datetime
+from io import BytesIO
 from typing import List, Optional, Tuple
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
+
+from openai import OpenAI
+from fastapi import UploadFile
+from pypdf import PdfReader
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.password_reset import PasswordResetToken
+from app.services.s3_service import S3Service
 
 from app.models.insight import AIInsight
 from app.models.bookmark import  Bookmark
 from app.models.company import Company
 from app.models.conversation import Conversation
 from app.models.document import Document
+from app.models.embedding import Embedding
 from app.models.message import Message
 from app.models.message import MessageSource
+from app.models.rag_chunk import RAGChunk
 from app.models.user import  User
 from app.services.email_service import EmailService
 from app.core.config import settings
@@ -195,12 +208,126 @@ class CompanyService:
         """Search companies."""
         return await self.company_repo.search(search or "", sector, skip, limit)
 
+    
+
+
+# Module-level cache: once legacy columns are dropped, skip ALTER TABLE on subsequent uploads
+_embeddings_table_ready: bool = False
+
+
+async def _ensure_embeddings_table(session: AsyncSession) -> None:
+    """
+    One-time setup: ensure pgvector extension + drop legacy JSON/vec columns.
+    """
+    global _embeddings_table_ready
+    if _embeddings_table_ready:
+        return
+    try:
+        await session.execute(sa_text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await session.execute(sa_text(
+            "ALTER TABLE embeddings DROP COLUMN IF EXISTS embedding"
+        ))
+        await session.execute(sa_text(
+            "ALTER TABLE embeddings DROP COLUMN IF EXISTS vec"
+        ))
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        return
+    _embeddings_table_ready = True
+
 
 class DocumentService:
     """Document service."""
 
     def __init__(self, session: AsyncSession):
         self.doc_repo = DocumentRepository(session)
+        self.s3 = S3Service()
+
+    async def get_pending_documents(self, limit: int = 50) -> List[Document]:
+        """Get documents that still need embeddings."""
+        return await self.doc_repo.get_documents_without_chunks(limit=limit)
+
+    async def process_pending_documents(self, limit: int = 50) -> int:
+        """Process documents that do not have embeddings yet."""
+        documents = await self.get_pending_documents(limit=limit)
+        processed = 0
+        for document in documents:
+            try:
+                success = await self.process_document_from_s3(document)
+                if success:
+                    processed += 1
+            except Exception as exc:
+                print(f"[documents] failed to process pending document {document.id}:", exc)
+        return processed
+
+    async def process_document_from_s3(self, document: Document) -> bool:
+        """Download a stored document from S3 and generate embeddings."""
+        if not document.file_url:
+            print(f"[documents] skipping document {document.id} because file_url is missing")
+            return False
+
+        try:
+            file_bytes = await self.s3.download_pdf(document.file_url)
+        except Exception as exc:
+            print(f"[documents] failed to download document {document.id} from S3:", exc)
+            return False
+
+        chunk_items, _ = self._extract_pdf_chunks(file_bytes)
+        if not chunk_items:
+            print(f"[documents] no text extracted for document {document.id}")
+            return False
+
+        return await self._process_document_embeddings(document, chunk_items)
+
+    async def _process_document_embeddings(self, document: Document, chunk_items: List[tuple[str, int]]) -> bool:
+        """
+        Generate embeddings and store directly into the pgvector embedding_vector column.
+
+        Creates RAGChunk rows for each chunk and Embedding rows with native
+        pgvector Vector values (not JSON). No manual cosine similarity is needed
+        at retrieval time — PostgreSQL handles it via the <=> operator.
+        """
+        if not chunk_items:
+            print("[documents] no text extracted from PDF, skipping embedding creation")
+            return False
+
+        session = self.doc_repo.session
+
+        # Ensure pgvector extension + drop legacy columns (one-time setup).
+        # _ensure_embeddings_table has its own cached check, so this is a
+        # fast no-op after the first successful run.
+        await _ensure_embeddings_table(session)
+
+        chunk_texts = [chunk_text for chunk_text, _ in chunk_items]
+
+        # Generate embeddings via OpenAI
+        embeddings = self._create_embeddings(chunk_texts)
+        if not embeddings or len(embeddings) != len(chunk_items):
+            print("[documents] embedding generation failed or returned wrong count")
+            return False
+
+        # Create RAGChunk + Embedding rows
+        for (chunk_text, page_number), embedding_vector in zip(chunk_items, embeddings):
+            rag_chunk = RAGChunk(
+                document_id=document.id,
+                company_id=document.company_id,
+                page_number=page_number,
+                chunk_text=chunk_text,
+            )
+            session.add(rag_chunk)
+            # Flush to get the chunk ID
+            await session.flush()
+
+            embedding_obj = Embedding(
+                chunk_id=rag_chunk.id,
+                embedding_vector=embedding_vector,
+            )
+            session.add(embedding_obj)
+
+        await session.commit()
+        print(f"[documents] created {len(chunk_items)} RAG chunks + embeddings for document {document.id}")
+        return True
 
     async def get_all(self, skip: int = 0, limit: int = 100) -> Tuple[List[Document], int]:
         """Get all documents."""
@@ -217,6 +344,27 @@ class DocumentService:
     async def search(self, search: str, skip: int = 0, limit: int = 100) -> Tuple[List[Document], int]:
         """Search documents."""
         return await self.doc_repo.search(search, skip, limit)
+
+    async def filter_documents(
+        self,
+        skip: int,
+        limit: int,
+        search: Optional[str] = None,
+        company_id: Optional[str] = None,
+        report_type: Optional[str] = None,
+        year: Optional[int] = None,
+        quarter: Optional[str] = None,
+    ) -> Tuple[List[Document], int]:
+        """Filter documents by metadata."""
+        return await self.doc_repo.filter_documents(
+            skip=skip,
+            limit=limit,
+            search=search,
+            company_id=company_id,
+            report_type=report_type,
+            year=year,
+            quarter=quarter,
+        )
 
     async def create(self, request: DocumentCreate) -> Document:
         """Create document."""
@@ -243,6 +391,138 @@ class DocumentService:
         """Delete document."""
         return await self.doc_repo.delete(doc_id)
 
+    async def upload_document(
+        self,
+        file: UploadFile,
+        company_id: str,
+        report_type: Optional[str] = None,
+        year: Optional[int] = None,
+        quarter: Optional[str] = None,
+    ) -> Document:
+        """Upload a document to S3, persist metadata, and create embeddings."""
+        file_bytes = await file.read()
+        file_url, size_mb = await self.s3.upload_pdf(
+            contents=file_bytes,
+            filename=file.filename,
+            content_type=file.content_type,
+            company_id=company_id,
+        )
+
+        chunks, page_count = self._extract_pdf_chunks(file_bytes)
+
+        document = Document(
+            id=f"doc_{uuid.uuid4().hex[:8]}",
+            company_id=company_id,
+            name=file.filename,
+            type=report_type,
+            quarter=quarter,
+            year=year,
+            page_count=page_count,
+            size_mb=size_mb,
+            uploaded_at=datetime.utcnow(),
+            file_url=file_url,
+            source_url=None,
+        )
+
+        print("[documents] persisting document to DB:", {
+            "id": document.id,
+            "company_id": document.company_id,
+            "name": document.name,
+            "type": document.type,
+            "quarter": document.quarter,
+            "year": document.year,
+            "page_count": document.page_count,
+            "size_mb": document.size_mb,
+            "uploaded_at": document.uploaded_at,
+            "file_url": document.file_url,
+            "source_url": document.source_url,
+        })
+
+        created_document = await self.doc_repo.create(document)
+        print("[documents] document persisted with id:", created_document.id)
+
+        if chunks:
+            await self._process_document_embeddings(created_document, chunks)
+
+        return created_document
+
+    def _extract_pdf_chunks(self, file_bytes: bytes) -> tuple[List[tuple[str, int]], Optional[int]]:
+        try:
+            reader = PdfReader(BytesIO(file_bytes))
+        except Exception as exc:
+            print("[documents] failed to read PDF:", exc)
+            return [], None
+
+        chunks: List[tuple[str, int]] = []
+        page_count = len(reader.pages)
+        for page_index, page in enumerate(reader.pages, start=1):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+
+            if not text.strip():
+                continue
+
+            page_chunks = self._split_text(text)
+            chunks.extend((chunk_text, page_index) for chunk_text in page_chunks)
+
+        return chunks, page_count
+
+    def _split_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        cleaned = " ".join(text.split())
+        if not cleaned:
+            return []
+
+        chunks: List[str] = []
+        start = 0
+        while start < len(cleaned):
+            end = min(start + chunk_size, len(cleaned))
+            chunks.append(cleaned[start:end])
+            start += chunk_size - overlap
+        return chunks
+
+    def _configure_embedding_client(self):
+        if settings.OPENAI_API_KEY:
+            print("[documents] using OpenAI")
+
+            return OpenAI(
+                api_key=settings.OPENAI_API_KEY,
+            )
+
+        if settings.OPENROUTER_API_KEY:
+            print("[documents] using OpenRouter")
+
+            return OpenAI(
+                api_key=settings.OPENROUTER_API_KEY,
+                base_url="https://openrouter.ai/api/v1",
+            )
+
+        return None
+
+    def _create_embeddings(self, texts: list[str]) -> list[list[float]]:
+        """
+        Generate embeddings for a list of texts using OpenAI text-embedding-3-small.
+
+        Returns a list of float vectors suitable for direct storage in
+        a pgvector Vector column. No JSON serialization is involved.
+        """
+        client = self._configure_embedding_client()
+
+        if client is None:
+            return []
+
+        try:
+            response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input=texts,
+            )
+
+            return [item.embedding for item in response.data]
+
+        except Exception as e:
+            print("Embedding Error:", e)
+            return []
 
 class ConversationService:
     """Conversation service."""
@@ -368,81 +648,38 @@ class AIInsightService:
 
 
 class ChatService:
-    """Chat service - handles AI interactions."""
+    """Chat service - handles AI interactions using RAG pipeline."""
 
     def __init__(self, session: AsyncSession):
         self.session = session
         self.conv_service = ConversationService(session)
         self.msg_service = MessageService(session)
 
-    async def chat(self, user_id: str, request: ChatRequest) -> Message:
+    async def chat(self, user_id: str, request: ChatRequest):
         """
-        Process chat request.
-        Currently returns mocked responses.
-        Future: Replace with OpenAI/Claude/DeepSeek + RAG.
-        """
-        # Get or create conversation
-        conv_id = request.conversation_id
-        if not conv_id:
-            conv = await self.conv_service.create(
-                user_id,
-                ConversationCreate(
-                    title=request.message[:50],
-                    company_id=request.company_id,
-                ),
-            )
-            conv_id = conv.id
+        Process chat request using the production RAG pipeline.
 
-        # Store user message
-        user_msg = await self.msg_service.create(
-            conv_id,
-            MessageCreate(
-                role="user",
-                content=request.message,
-                model=request.model,
-            ),
+        Orchestrates:
+          1. RAG context retrieval (PGVector similarity search)
+          2. Prompt building with financial assistant system prompt
+          3. OpenRouter LLM call with fallback models
+          4. Message persistence
+
+        Returns:
+            dict with conversation_id and content
+        """
+        from app.services.rag_service import run_rag_pipeline
+
+        conversation_id, content, used_model = await run_rag_pipeline(
+            session=self.session,
+            user_id=user_id,
+            message=request.message,
+            model=request.model or "openai/gpt-4o",
+            company_id=request.company_id,
+            conversation_id=request.conversation_id,
         )
 
-        # Generate mocked assistant response
-        assistant_response = self._generate_mock_response(request)
-
-        # Store assistant message
-        assistant_msg = await self.msg_service.create(
-            conv_id,
-            MessageCreate(
-                role="assistant",
-                content=assistant_response,
-                model=request.model,
-            ),
-        )
-
-        return assistant_msg
-
-    def _generate_mock_response(self, request: ChatRequest) -> str:
-        """Generate mock AI response for now."""
-        company = request.company_id or "the company"
-        
-        # Mock responses based on keywords
-        if "quarterly results" in request.message.lower() or "results" in request.message.lower():
-            return f"Based on the latest filings for {company}, the quarterly results show strong performance with consistent revenue growth. The net profit margin improved by 2.3% compared to the previous quarter, driven by operational efficiency improvements and market expansion."
-        
-        elif "risk" in request.message.lower():
-            return f"Key risks identified for {company} include: 1) Market volatility and competitive pressures, 2) Regulatory changes in key markets, 3) Supply chain disruptions, and 4) Currency fluctuations. These are typical industry risks that the company actively monitors and mitigates."
-        
-        elif "growth" in request.message.lower() or "expansion" in request.message.lower():
-            return f"{company} demonstrates strong growth drivers including: 1) Expansion into emerging markets, 2) Digital transformation initiatives, 3) Product portfolio diversification, and 4) Strategic partnerships. Year-over-year growth is projected at 15-20% for the next fiscal year."
-        
-        elif "management" in request.message.lower() or "commentary" in request.message.lower():
-            return f"Management commentary indicates confidence in the company's strategic direction. The leadership team emphasizes focus on innovation, operational excellence, and customer satisfaction. They believe current market conditions present significant opportunities for growth and market share expansion."
-        
-        elif "bullish" in request.message.lower() or "positive" in request.message.lower():
-            return f"Bullish signals for {company}: Strong cash flow generation, improving margins, market leadership position, and successful new product launches. Analyst consensus shows a 'buy' rating with price target upside of 25-30% over the next 12 months."
-        
-        elif "bearish" in request.message.lower() or "negative" in request.message.lower():
-            return f"Some bearish indicators include: Increased competition in core markets, rising input costs, and margin compression in certain segments. However, management's strategic initiatives are expected to address these challenges over the medium term."
-        
-        elif "profit" in request.message.lower() or "revenue" in request.message.lower():
-            return f"Revenue for {company} reached $5.2B in the latest quarter, representing 8% YoY growth. Net profit margin is 18%, with EBITDA of $1.1B. Strong profitability is supported by operational efficiency and pricing power in key markets."
-        
-        else:
-            return f"Based on the available financial documents and filings for {company}, I can provide comprehensive analysis of their financial metrics, risks, growth prospects, and management outlook. Please feel free to ask specific questions about revenue, profitability, market position, or any other aspect of the company's performance."
+        return {
+            "conversation_id": conversation_id,
+            "content": content,
+        }

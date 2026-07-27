@@ -3,6 +3,7 @@ InvestorDocs AI Backend - Main Application
 Production-ready FastAPI application with comprehensive middleware and error handling.
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -13,12 +14,30 @@ from fastapi.responses import JSONResponse
 
 from app.api import auth, bookmarks, chat, companies, conversations, documents, insights, messages, users
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.logging import setup_logging
+from app.services.services import DocumentService
 
 # Setup structured logging
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+async def _embedding_scheduler_loop(app: FastAPI):
+    interval = 1800  # 30 minutes
+    logger.info(f"Embedding scheduler started, running every {interval} seconds")
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                service = DocumentService(session)
+                processed = await service.process_pending_documents(limit=100)
+                if processed:
+                    logger.info(f"Embedding scheduler processed {processed} pending documents")
+                else:
+                    logger.info("Embedding scheduler found no pending documents")
+        except Exception as exc:
+            logger.error(f"Embedding scheduler error: {exc}", exc_info=exc)
+        await asyncio.sleep(interval)
 
 
 @asynccontextmanager
@@ -29,11 +48,19 @@ async def lifespan(app: FastAPI):
     
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    app.state.embedding_scheduler_task = asyncio.create_task(_embedding_scheduler_loop(app))
     
     yield
     
     # Shutdown
     logger.info("Shutting down InvestorDocs AI Backend")
+    if hasattr(app.state, "embedding_scheduler_task"):
+        app.state.embedding_scheduler_task.cancel()
+        try:
+            await app.state.embedding_scheduler_task
+        except asyncio.CancelledError:
+            pass
     await engine.dispose()
 
 
