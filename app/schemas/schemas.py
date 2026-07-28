@@ -204,6 +204,22 @@ class DocumentListResponse(BaseModel):
     items: List[DocumentResponse]
 
 
+class DocumentPreviewResponse(BaseModel):
+    """Document preview URL response."""
+
+    success: bool = True
+    preview_url: str
+    expires_in: int = 3600
+
+
+class DocumentDownloadResponse(BaseModel):
+    """Document download URL response."""
+
+    success: bool = True
+    download_url: str
+    expires_in: int = 3600
+
+
 # ============================================================================
 # Conversation Schemas
 # ============================================================================
@@ -449,3 +465,49 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     password: str = Field(..., min_length=8)
+
+
+# ============================================================================
+# Admin User Schemas
+# ============================================================================
+
+
+class AdminUserUpdate(BaseModel):
+    """Admin user update schema."""
+
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    role: Optional[str] = None
+    plan: Optional[str] = None
+
+
+class AdminUserResponse(BaseModel):
+    """
+    Admin user response schema.
+
+    Fields are defined in camelCase for direct frontend Admin Dashboard
+    compatibility. The service layer constructs these with camelCase kwargs,
+    so no alias remapping is needed.
+    """
+
+    id: str
+    firstName: Optional[str] = None
+    lastName: Optional[str] = None
+    fullName: str
+    email: str
+    role: str
+    plan: str
+    createdAt: datetime
+    lastActiveAt: Optional[datetime] = None
+    conversationCount: int = 0
+    documentCount: int = 0
+
+
+class AdminUserListResponse(BaseModel):
+    """Paginated admin user list response."""
+
+    success: bool = True
+    page: int
+    limit: int
+    total: int
+    items: List[AdminUserResponse]

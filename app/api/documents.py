@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
-from app.schemas.schemas import DocumentCreate, DocumentListResponse, DocumentResponse, DocumentUpdate
+from app.schemas.schemas import DocumentCreate, DocumentListResponse, DocumentPreviewResponse, DocumentDownloadResponse, DocumentResponse, DocumentUpdate
 from app.services.services import DocumentService
 
 router = APIRouter()
@@ -140,6 +140,65 @@ async def delete_document(
         "success": True,
         "message": "Document deleted successfully",
     }
+
+
+@router.get("/{document_id}/preview", response_model=DocumentPreviewResponse)
+async def preview_document(
+    document_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Generate a presigned URL to preview a PDF document in the browser.
+
+    - Looks up the document in PostgreSQL.
+    - Reads the S3 object and generates a presigned GET URL valid for 1 hour.
+    - Does NOT download the PDF content — only returns a secure URL.
+    - The presigned URL can be used directly in an <iframe> or browser.
+    """
+    service = DocumentService(session)
+    try:
+        result = await service.get_preview_url(document_id)
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except Exception as e:
+        print(f"[documents] preview failed for {document_id}:", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate preview URL. Please try again later.",
+        )
+
+
+@router.get("/{document_id}/download", response_model=DocumentDownloadResponse)
+async def download_document(
+    document_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Generate a presigned URL to download a PDF document.
+
+    - Looks up the document in PostgreSQL.
+    - Generates a presigned URL with Content-Disposition: attachment.
+    - The presigned URL can be used with window.open() or <a> download.
+    """
+    service = DocumentService(session)
+    try:
+        result = await service.get_download_url(document_id)
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except Exception as e:
+        print(f"[documents] download failed for {document_id}:", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate download URL. Please try again later.",
+        )
 
 
 @router.post("/upload", response_model=dict, status_code=status.HTTP_201_CREATED)

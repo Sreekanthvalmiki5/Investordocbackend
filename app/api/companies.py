@@ -17,7 +17,7 @@ from app.services.services import CompanyService
 router = APIRouter()
 
 
-@router.get("/companies", response_model=CompanyListResponse)
+@router.get("", response_model=CompanyListResponse)
 async def list_companies(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),

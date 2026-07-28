@@ -3,10 +3,12 @@ Repository Layer
 Data access layer with SQLAlchemy async queries.
 """
 
+from datetime import datetime
 from typing import List, Optional, Tuple
 
-from sqlalchemy import select,delete, func, or_
+from sqlalchemy import select, delete, func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.sql import Select
 
 from app.models.bookmark import Bookmark
@@ -67,6 +69,112 @@ class UserRepository:
         await self.session.delete(user)
         await self.session.commit()
         return True
+
+    async def list_users(
+        self,
+        skip: int = 0,
+        limit: int = 20,
+        search: Optional[str] = None,
+        role: Optional[str] = None,
+        plan: Optional[str] = None,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
+    ) -> Tuple[List[Tuple[User, int, Optional[datetime]]], int]:
+        """
+        List users with pagination, filters, and aggregate counts.
+
+        Returns a tuple of:
+          - List of (User, conversation_count, last_active_at) tuples
+          - Total count (before pagination)
+
+        Uses aggregate subqueries to avoid N+1 queries.
+        """
+        from app.models.conversation import Conversation
+
+        # ---- Subquery: conversation_count per user ----
+        conv_count_subq = (
+            select(
+                Conversation.user_id,
+                func.count(Conversation.id).label("cnt"),
+            )
+            .group_by(Conversation.user_id)
+            .subquery()
+        )
+
+        # ---- Subquery: last_active_at (most recent conversation updated_at per user) ----
+        last_active_subq = (
+            select(
+                Conversation.user_id,
+                func.max(Conversation.updated_at).label("last_active"),
+            )
+            .group_by(Conversation.user_id)
+            .subquery()
+        )
+
+        # ---- Main query ----
+        stmt = (
+            select(
+                User,
+                func.coalesce(conv_count_subq.c.cnt, 0).label("conversation_count"),
+                func.coalesce(last_active_subq.c.last_active, User.updated_at).label("last_active_at"),
+            )
+            .outerjoin(conv_count_subq, User.id == conv_count_subq.c.user_id)
+            .outerjoin(last_active_subq, User.id == last_active_subq.c.user_id)
+        )
+
+        # ---- Filters ----
+        if search:
+            search_filter = or_(
+                User.first_name.ilike(f"%{search}%"),
+                User.last_name.ilike(f"%{search}%"),
+                User.email.ilike(f"%{search}%"),
+            )
+            stmt = stmt.where(search_filter)
+
+        if role:
+            stmt = stmt.where(User.role == role)
+
+        if plan:
+            stmt = stmt.where(User.plan == plan)
+
+        # ---- Total count (before pagination) ----
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        total = await self.session.scalar(count_stmt) or 0
+
+        # ---- Sorting ----
+        if sort_by == "created_at":
+            order_col = User.created_at
+        elif sort_by == "email":
+            order_col = User.email
+        elif sort_by == "first_name":
+            order_col = User.first_name
+        elif sort_by == "last_active_at":
+            order_col = func.coalesce(last_active_subq.c.last_active, User.updated_at)
+        elif sort_by == "role":
+            order_col = User.role
+        elif sort_by == "plan":
+            order_col = User.plan
+        else:
+            order_col = User.created_at
+
+        if sort_order == "asc":
+            stmt = stmt.order_by(order_col.asc())
+        else:
+            stmt = stmt.order_by(order_col.desc())
+
+        # ---- Pagination ----
+        stmt = stmt.offset(skip).limit(limit)
+
+        result = await self.session.execute(stmt)
+        rows = result.all()
+
+        # rows are Row[User, int, datetime] — unpack into (User, conv_count, last_active)
+        users_with_counts: List[Tuple[User, int, Optional[datetime]]] = [
+            (row.User, row.conversation_count, row.last_active_at)
+            for row in rows
+        ]
+
+        return users_with_counts, total
 
 
 class CompanyRepository:
@@ -352,6 +460,30 @@ class ConversationRepository:
         await self.session.commit()
         return True
 
+    async def sync_message_count(self, conv_id: str) -> None:
+        """
+        Atomically update `message_count` using COUNT(*) on the messages table.
+
+        Also touches `updated_at` so the frontend can sort conversations by
+        last activity without relying on manual increment/decrement logic.
+        """
+        count_stmt = (
+            select(func.count())
+            .where(Message.conversation_id == conv_id)
+        )
+        result = await self.session.execute(count_stmt)
+        count = result.scalar() or 0
+
+        stmt = (
+            update(Conversation)
+            .where(Conversation.id == conv_id)
+            .values(
+                message_count=count,
+                updated_at=datetime.utcnow(),
+            )
+        )
+        await self.session.execute(stmt)
+
 
 class MessageRepository:
     """Repository for Message model."""
@@ -366,9 +498,13 @@ class MessageRepository:
         return result.scalar_one_or_none()
 
     async def get_by_conversation(self, conv_id: str) -> List[Message]:
-        """Get all messages in a conversation, ordered by creation time."""
+        """Get all messages in a conversation, ordered by creation time.
+
+        Uses eager loading on `sources` to avoid N+1 queries.
+        """
         stmt = (
             select(Message)
+            .options(selectinload(Message.sources))
             .where(Message.conversation_id == conv_id)
             .order_by(Message.created_at.asc())
         )

@@ -46,7 +46,12 @@ from app.repositories.repositories import (
     PasswordResetRepository
 )
 from app.schemas.schemas import (
+    AdminUserResponse,
+    AdminUserListResponse,
+    AdminUserUpdate,
     ChatRequest,
+    CompanyCreate,
+    CompanyUpdate,
     ConversationCreate,
     ConversationUpdate,
     DocumentCreate,
@@ -55,7 +60,9 @@ from app.schemas.schemas import (
     MessageCreate,
     RegisterRequest,
     UserUpdate,
-    ResetPasswordRequest
+    ResetPasswordRequest,
+    DocumentPreviewResponse,
+    DocumentDownloadResponse,
 )
 from app.core.security import create_access_token, hash_password, verify_password
 
@@ -169,6 +176,7 @@ class UserService:
 
     def __init__(self, session: AsyncSession):
         self.user_repo = UserRepository(session)
+        self.session = session
 
     async def get_profile(self, user_id: str) -> Optional[User]:
         """Get user profile."""
@@ -182,6 +190,153 @@ class UserService:
             last_name=request.last_name,
             image_url=request.image_url,
         )
+
+    # ------------------------------------------------------------------
+    # Admin: List Users
+    # ------------------------------------------------------------------
+
+    async def list_users(
+        self,
+        page: int = 1,
+        limit: int = 20,
+        search: Optional[str] = None,
+        role: Optional[str] = None,
+        plan: Optional[str] = None,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
+    ) -> AdminUserListResponse:
+        """
+        Paginated list of all users with aggregate counts.
+
+        Returns an AdminUserListResponse ready for the Admin Dashboard.
+        """
+        skip = (page - 1) * limit
+        users_with_counts, total = await self.user_repo.list_users(
+            skip=skip,
+            limit=limit,
+            search=search,
+            role=role,
+            plan=plan,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+
+        items = []
+        for user, conversation_count, last_active_at in users_with_counts:
+            first_name = user.first_name or ""
+            last_name = user.last_name or ""
+            full_name = f"{first_name} {last_name}".strip() or user.email
+
+            # Build the response using model_validate and then dump with aliases
+            items.append(
+                AdminUserResponse(
+                    id=str(user.id),
+                    firstName=first_name,
+                    lastName=last_name,
+                    fullName=full_name,
+                    email=user.email,
+                    role=user.role,
+                    plan=user.plan,
+                    createdAt=user.created_at,
+                    lastActiveAt=last_active_at,
+                    conversationCount=conversation_count,
+                    documentCount=0,  # No direct user->document FK; reserved for future
+                )
+            )
+
+        return AdminUserListResponse(
+            success=True,
+            page=page,
+            limit=limit,
+            total=total,
+            items=items,
+        )
+
+    # ------------------------------------------------------------------
+    # Admin: Get Single User
+    # ------------------------------------------------------------------
+
+    async def get_user(self, user_id: str) -> Optional[AdminUserResponse]:
+        """Get a single user with aggregate counts."""
+        user = await self.user_repo.get_by_id(user_id)
+        if not user:
+            return None
+
+        # Fetch aggregate counts via the same subquery logic as list_users
+        from app.repositories.repositories import Conversation
+        from sqlalchemy import func, select
+
+        conv_count_subq = (
+            select(
+                Conversation.user_id,
+                func.count(Conversation.id).label("cnt"),
+            )
+            .where(Conversation.user_id == user_id)
+            .group_by(Conversation.user_id)
+            .subquery()
+        )
+
+        last_active_subq = (
+            select(
+                Conversation.user_id,
+                func.max(Conversation.updated_at).label("last_active"),
+            )
+            .where(Conversation.user_id == user_id)
+            .group_by(Conversation.user_id)
+            .subquery()
+        )
+
+        stmt = select(
+            func.coalesce(conv_count_subq.c.cnt, 0),
+            func.coalesce(last_active_subq.c.last_active, user.updated_at),
+        ).select_from(
+            conv_count_subq
+        ).outerjoin(
+            last_active_subq, conv_count_subq.c.user_id == last_active_subq.c.user_id
+        )
+
+        result = await self.session.execute(stmt)
+        row = result.first()
+
+        conversation_count = row[0] if row else 0
+        last_active_at = row[1] if row else user.updated_at
+
+        first_name = user.first_name or ""
+        last_name = user.last_name or ""
+        full_name = f"{first_name} {last_name}".strip() or user.email
+
+        return AdminUserResponse(
+            id=str(user.id),
+            firstName=first_name,
+            lastName=last_name,
+            fullName=full_name,
+            email=user.email,
+            role=user.role,
+            plan=user.plan,
+            createdAt=user.created_at,
+            lastActiveAt=last_active_at,
+            conversationCount=conversation_count,
+            documentCount=0,
+        )
+
+    # ------------------------------------------------------------------
+    # Admin: Update User
+    # ------------------------------------------------------------------
+
+    async def update_user(self, user_id: str, request: AdminUserUpdate) -> Optional[User]:
+        """Update user fields (admin)."""
+        kwargs = request.model_dump(exclude_unset=True)
+        if not kwargs:
+            return await self.user_repo.get_by_id(user_id)
+        return await self.user_repo.update(user_id, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Admin: Delete User
+    # ------------------------------------------------------------------
+
+    async def delete_user(self, user_id: str) -> bool:
+        """Delete a user and all related data via cascade."""
+        return await self.user_repo.delete(user_id)
 
 
 class CompanyService:
@@ -208,7 +363,30 @@ class CompanyService:
         """Search companies."""
         return await self.company_repo.search(search or "", sector, skip, limit)
 
-    
+    async def create(self, request: CompanyCreate) -> Company:
+        """Create a new company."""
+        company = Company(
+            id=str(uuid.uuid4()),
+            name=request.name,
+            ticker=request.ticker,
+            sector=request.sector,
+            industry=request.industry,
+            market_cap_cr=request.market_cap_cr,
+            description=request.description,
+            color=request.color,
+        )
+        return await self.company_repo.create(company)
+
+    async def update(self, company_id: str, request: CompanyUpdate) -> Optional[Company]:
+        """Update company fields."""
+        return await self.company_repo.update(
+            company_id,
+            **request.model_dump(exclude_unset=True),
+        )
+
+    async def delete(self, company_id: str) -> bool:
+        """Delete a company."""
+        return await self.company_repo.delete(company_id)
 
 
 # Module-level cache: once legacy columns are dropped, skip ALTER TABLE on subsequent uploads
@@ -391,6 +569,66 @@ class DocumentService:
         """Delete document."""
         return await self.doc_repo.delete(doc_id)
 
+    async def get_preview_url(self, document_id: str) -> DocumentPreviewResponse:
+        """
+        Generate a presigned URL for viewing a document in the browser.
+
+        Args:
+            document_id: The document's unique ID.
+
+        Returns:
+            DocumentPreviewResponse with a presigned URL valid for 1 hour.
+
+        Raises:
+            ValueError: If the document is not found or has no file_url.
+        """
+        document = await self.doc_repo.get_by_id(document_id)
+        if not document:
+            raise ValueError(f"Document {document_id} not found")
+        if not document.file_url:
+            raise ValueError(f"Document {document_id} has no file URL")
+
+        preview_url = await self.s3.generate_presigned_url(
+            key_or_url=document.file_url,
+            expiration=3600,
+        )
+
+        return DocumentPreviewResponse(
+            success=True,
+            preview_url=preview_url,
+            expires_in=3600,
+        )
+
+    async def get_download_url(self, document_id: str) -> DocumentDownloadResponse:
+        """
+        Generate a presigned URL for downloading a document.
+
+        Args:
+            document_id: The document's unique ID.
+
+        Returns:
+            DocumentDownloadResponse with a presigned download URL valid for 1 hour.
+
+        Raises:
+            ValueError: If the document is not found or has no file_url.
+        """
+        document = await self.doc_repo.get_by_id(document_id)
+        if not document:
+            raise ValueError(f"Document {document_id} not found")
+        if not document.file_url:
+            raise ValueError(f"Document {document_id} has no file URL")
+
+        download_url = await self.s3.generate_download_url(
+            key_or_url=document.file_url,
+            expiration=3600,
+        )
+
+        return DocumentDownloadResponse(
+            success=True,
+            download_url=download_url,
+            expires_in=3600,
+        )
+
     async def upload_document(
         self,
         file: UploadFile,
@@ -401,7 +639,7 @@ class DocumentService:
     ) -> Document:
         """Upload a document to S3, persist metadata, and create embeddings."""
         file_bytes = await file.read()
-        file_url, size_mb = await self.s3.upload_pdf(
+        s3_key, size_mb = await self.s3.upload_pdf(
             contents=file_bytes,
             filename=file.filename,
             content_type=file.content_type,
@@ -420,7 +658,7 @@ class DocumentService:
             page_count=page_count,
             size_mb=size_mb,
             uploaded_at=datetime.utcnow(),
-            file_url=file_url,
+            file_url=s3_key,
             source_url=None,
         )
 

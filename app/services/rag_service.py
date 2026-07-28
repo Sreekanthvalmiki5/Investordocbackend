@@ -35,12 +35,22 @@ _vector_extension_ready: bool = False
 # ============================================================================
 
 SYSTEM_PROMPT = (
-    "You are an AI financial assistant.\n\n"
-    "Answer ONLY using the provided context.\n\n"
-    "If the answer is not present in the context, reply:\n"
-    "'I could not find this information in the uploaded documents.'\n\n"
-    "Never invent facts.\n\n"
-    "Generate a complete professional answer in Markdown."
+    """You are an AI financial assistant.
+
+Answer ONLY using the retrieved document context.
+
+Formatting rules:
+
+- Use Markdown headings.
+- Present financial figures in tables whenever appropriate.
+- Highlight important values in bold.
+- If multiple years or periods are available, compare them in a table.
+- Always include a short summary after the table.
+- At the end, list the document sources and page numbers used.
+- Never expose internal reasoning or chain of thought.
+- If the information is not present in the retrieved context, reply:
+  "I could not find this information in the uploaded documents."
+    """
 )
 
 # Primary model (fast, reliable, no reasoning overhead)
@@ -511,7 +521,41 @@ def _fallback_response() -> str:
 
 
 # ============================================================================
-# 6. Save Messages to Database
+# 6. Title Auto-Update Helpers
+# ============================================================================
+
+
+def _should_update_title(title: Optional[str]) -> bool:
+    """
+    Return True if the conversation title is still a placeholder and should
+    be replaced with the first user message.
+    """
+    if title is None:
+        return True
+    stripped = title.strip()
+    if not stripped:
+        return True
+    if stripped == "New chat":
+        return True
+    if stripped.startswith("Conversation "):
+        return True
+    return False
+
+
+def _clean_title(raw: str) -> str:
+    """
+    Normalise a user message for use as a conversation title.
+
+    - Strips leading/trailing whitespace
+    - Removes internal line breaks (replaces with space)
+    - Truncates to 80 characters
+    """
+    cleaned = " ".join(raw.split())  # collapses all whitespace into single spaces
+    return cleaned[:80]
+
+
+# ============================================================================
+# 7. Save Messages to Database
 # ============================================================================
 
 async def save_messages(
@@ -566,13 +610,27 @@ async def save_messages(
             )
             session.add(source)
 
-    conv = await conv_repo.get_by_id(conversation_id)
-    if conv:
-        await conv_repo.update(conversation_id, message_count=(conv.message_count or 0) + 2)
-
     await session.commit()
     await session.refresh(user_msg)
     await session.refresh(assistant_msg)
+
+    # Atomically sync message_count via COUNT(*) and touch updated_at
+    await conv_repo.sync_message_count(conversation_id)
+
+    # Automatically update title if it is still a placeholder value.
+    conv = await conv_repo.get_by_id(conversation_id)
+    if conv and _should_update_title(conv.title):
+        old_title = conv.title
+        new_title = _clean_title(user_message)
+        if new_title:
+            conv.title = new_title
+            conv.updated_at = datetime.utcnow()
+            logger.info(
+                "Auto-updated conversation %s title from '%s' to '%s'",
+                conversation_id, old_title or '(empty)', new_title,
+            )
+
+    await session.commit()
 
     logger.info(
         "Saved user msg=%s and assistant msg=%s to conversation %s",

@@ -30,7 +30,7 @@ async def _embedding_scheduler_loop(app: FastAPI):
         try:
             async with AsyncSessionLocal() as session:
                 service = DocumentService(session)
-                processed = await service.process_pending_documents(limit=100)
+                processed = await service.process_pending_documents(limit=200)
                 if processed:
                     logger.info(f"Embedding scheduler processed {processed} pending documents")
                 else:
@@ -113,6 +113,7 @@ app.include_router(companies.router, prefix="/api/companies", tags=["Companies"]
 app.include_router(documents.router, prefix="/api/documents", tags=["Documents"])
 app.include_router(conversations.router, prefix="/api/conversations", tags=["Conversations"])
 app.include_router(messages.router, prefix="/api/conversations", tags=["Messages"])
+app.include_router(messages.messages_router, prefix="/api/messages", tags=["Messages"])
 app.include_router(bookmarks.router, prefix="/api/bookmarks", tags=["Bookmarks"])
 app.include_router(insights.router, prefix="/api/insights", tags=["AI Insights"])
 app.include_router(chat.router, prefix="/api/chat", tags=["Chat"])

@@ -1,8 +1,9 @@
 """
 Messages Routes
-GET /api/conversations/{id}/messages
-POST /api/messages
-DELETE /api/messages/{id}
+
+Routers defined in this file:
+  - `/api/conversations/…` — legacy routes nested under conversations
+  - `/api/messages/…`       — new, clean message-centric routes
 """
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -14,7 +15,81 @@ from app.models.user import User
 from app.schemas.schemas import MessageCreate, MessageListResponse, MessageResponse
 from app.services.services import ConversationService, MessageService, UserService
 
+# Router for legacy routes mounted at /api/conversations
 router = APIRouter()
+
+# Router for new message-centric routes mounted at /api/messages
+messages_router = APIRouter()
+
+
+async def get_current_user_from_header(
+    authorization: str = Header(None),
+    session: AsyncSession = Depends(get_session),
+) -> User:
+    """Get current user from Authorization header."""
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authorization header",
+        )
+
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+    user_id = decode_token(token)
+
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+
+    service = UserService(session)
+    user = await service.get_profile(user_id)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    return user
+
+
+@messages_router.get("/conversation/{conversation_id}", response_model=MessageListResponse)
+async def get_conversation_messages_new(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user_from_header),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Get all messages in a conversation (new message-centric route).
+
+    Path: GET /api/messages/conversation/{conversation_id}
+
+    Returns all messages (user + assistant) with sources, ordered by
+    created_at ASC. The conversation must belong to the authenticated user.
+    """
+    conv_service = ConversationService(session)
+    conversation = await conv_service.get_by_id(conversation_id)
+
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+
+    if conversation.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this conversation",
+        )
+
+    msg_service = MessageService(session)
+    messages = await msg_service.get_by_conversation(conversation_id)
+
+    return MessageListResponse(
+        success=True,
+        items=[MessageResponse.model_validate(m) for m in messages],
+    )
 
 
 async def get_current_user_from_header(
