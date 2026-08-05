@@ -11,6 +11,7 @@ from app.models.insight import AIInsight
 from app.models.rag_chunk import RAGChunk
 from app.models.embedding import Embedding
 from app.models.query_cache import QueryCache
+from app.models.email_outbox import EmailOutbox
 
 __all__ = [
     "User",
@@ -24,4 +25,5 @@ __all__ = [
     "RAGChunk",
     "Embedding",
     "QueryCache",
+    "EmailOutbox",
 ]

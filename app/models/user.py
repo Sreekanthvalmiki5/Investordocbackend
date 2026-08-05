@@ -52,6 +52,52 @@ class User(Base):
         default="email",
     )
 
+    # Google OAuth
+    google_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
+
+    avatar_url: Mapped[Optional[str]] = mapped_column(
+        String,
+        nullable=True,
+    )
+
+    # Email verification
+    email_verified: Mapped[bool] = mapped_column(
+        default=False,
+        server_default="false",
+    )
+
+    verification_token: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+    )
+
+    verification_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    # Last login tracking (used for login notification emails)
+    last_login: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    last_login_ip: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    last_login_device: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,

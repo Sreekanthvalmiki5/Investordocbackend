@@ -99,12 +99,10 @@ async def delete_bookmark(
     current_user: User = Depends(get_current_user_from_header),
     session: AsyncSession = Depends(get_session),
 ):
-    """Delete a bookmark."""
+    """Delete a bookmark owned by the current user."""
     service = BookmarkService(session)
-    bookmark = await service.get_by_user(current_user.id)  # This needs adjustment in real code
-    
-    # For now, just delete by ID
-    success = await service.delete(id)
+    # Atomic ownership check + delete: only the owner's bookmark is removed.
+    success = await service.delete_owned(id, current_user.id)
 
     if not success:
         raise HTTPException(

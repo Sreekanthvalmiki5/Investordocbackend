@@ -6,7 +6,7 @@ Environment variables and settings management using Pydantic.
 from typing import List
 
 from pydantic_settings import BaseSettings
-
+import os
 
 class Settings(BaseSettings):
     """Application settings from environment variables."""
@@ -37,6 +37,42 @@ class Settings(BaseSettings):
     # Security
     PASSWORD_MIN_LENGTH: int = 8
     BCRYPT_ROUNDS: int = 12
+
+    # Google OAuth (ID-token + server-side redirect flows)
+    GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
+
+    GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+    GOOGLE_REDIRECT_URI: str = os.getenv("GOOGLE_REDIRECT_URI", "")
+
+    # Email verification
+    VERIFICATION_TOKEN_EXPIRE_HOURS: int = 24
+
+    # Email retry scheduler (failed emails are persisted to the outbox table
+    # and re-sent in the background every EMAIL_RETRY_INTERVAL_MINUTES).
+    EMAIL_RETRY_INTERVAL_MINUTES: int = 10
+    EMAIL_MAX_RETRIES: int = 5
+    EMAIL_RETRY_BATCH_SIZE: int = 100
+    # Delivered/given-up outbox rows older than this are purged by the
+    # scheduler so the table cannot grow unboundedly.
+    EMAIL_OUTBOX_RETENTION_DAYS: int = 7
+
+    # Login notification emails
+    LOGIN_NOTIFICATION_ENABLED: bool = True
+    IP_GEOLOCATION_ENABLED: bool = True
+
+    # Media uploads (voice queries / image analysis)
+    MAX_AUDIO_UPLOAD_MB: int = 25
+    MAX_IMAGE_UPLOAD_MB: int = 10
+
+    # Speech-to-text (Faster-Whisper, fully local — no OpenAI key required)
+    # Model sizes: tiny | base | small | medium | large-v3
+    WHISPER_MODEL: str = "small"
+    WHISPER_DEVICE: str = "cpu"
+    WHISPER_COMPUTE_TYPE: str = "int8"
+
+    # Vision model
+    VISION_MODEL: str = "openai/gpt-4o-mini"
 
     # Pagination
     DEFAULT_PAGE_SIZE: int = 20
@@ -74,3 +110,8 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def is_openrouter_key(key: str) -> bool:
+    """Return True if the API key looks like an OpenRouter key (sk-or-...)."""
+    return key.strip().startswith("sk-or-")

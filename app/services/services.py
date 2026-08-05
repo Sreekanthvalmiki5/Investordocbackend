@@ -31,8 +31,9 @@ from app.models.message import Message
 from app.models.message import MessageSource
 from app.models.rag_chunk import RAGChunk
 from app.models.user import  User
-from app.services.email_service import EmailService
-from app.core.config import settings
+from app.services.email_service import EmailService, parse_user_agent, send_email_background
+from app.services.google_auth import verify_google_id_token
+from app.core.config import is_openrouter_key, settings
 
 from app.repositories.repositories import (
     AIInsightRepository,
@@ -67,6 +68,13 @@ from app.schemas.schemas import (
 from app.core.security import create_access_token, hash_password, verify_password
 
 
+# Per-process cooldown for verification emails so the resend endpoint cannot
+# be abused to spam an unverified account's inbox.
+_verification_cooldowns: dict = {}
+_VERIFICATION_RESEND_COOLDOWN = timedelta(seconds=60)
+_VERIFICATION_COOLDOWN_MAX = 5000
+
+
 class AuthService:
     """Authentication service."""
 
@@ -76,36 +84,230 @@ class AuthService:
         self.reset_repo = PasswordResetRepository(session)
         self.email_service = EmailService()
 
+    # ------------------------------------------------------------------
+    # Registration & verification
+    # ------------------------------------------------------------------
+
     async def register(self, request: RegisterRequest) -> User:
-        """Register a new user."""
-        # Check if user exists
+        """Register a new email/password user and email a verification link."""
         existing = await self.user_repo.get_by_email(request.email)
-        print("Existing user:", existing) 
+        print("Existing user:", existing)
         if existing:
             raise ValueError(
-        "An account with this email already exists. Please sign in or reset your password."
-    )
+                "An account with this email already exists. Please sign in or reset your password."
+            )
 
-        # Create user
+        verification_token = secrets.token_urlsafe(32)
+
         user = User(
-          
             email=request.email,
             password_hash=hash_password(request.password),
             first_name=request.first_name,
             last_name=request.last_name,
             auth_provider="email",
+            email_verified=False,
+            verification_token=verification_token,
+            verification_expires_at=datetime.utcnow()
+            + timedelta(hours=settings.VERIFICATION_TOKEN_EXPIRE_HOURS),
         )
 
-        return await self.user_repo.create(user)
+        created = await self.user_repo.create(user)
 
-    async def login(self, request: LoginRequest) -> Tuple[User, str]:
+        # Send the verification email in the background so registration is never
+        # blocked by SMTP latency or outages.
+        self._send_verification_email(created)
+
+        return created
+
+    async def verify_email(self, token: str) -> None:
+        """Verify a user's email using the emailed token (24h expiry)."""
+        user = await self.user_repo.get_by_verification_token(token)
+        if not user:
+            raise ValueError(
+                "This verification link is invalid or has already been used."
+            )
+
+        if user.verification_expires_at and user.verification_expires_at < datetime.utcnow():
+            raise ValueError(
+                "This verification link has expired. Please request a new one."
+            )
+
+        user.email_verified = True
+        user.verification_token = None
+        user.verification_expires_at = None
+        await self.session.commit()
+
+    async def resend_verification(self, email: str) -> None:
+        """Regenerate and resend the verification email for an unverified account."""
+        user = await self.user_repo.get_by_email(email)
+
+        # Never reveal whether an account exists.
+        if not user or user.email_verified or user.auth_provider != "email":
+            return
+
+        # Cooldown: ignore rapid-fire resend requests (rate limiting).
+        now = datetime.utcnow()
+        last_sent = _verification_cooldowns.get(user.email)
+        if last_sent and now - last_sent < _VERIFICATION_RESEND_COOLDOWN:
+            return
+        if len(_verification_cooldowns) > _VERIFICATION_COOLDOWN_MAX:
+            _verification_cooldowns.clear()
+
+        user.verification_token = secrets.token_urlsafe(32)
+        user.verification_expires_at = now + timedelta(
+            hours=settings.VERIFICATION_TOKEN_EXPIRE_HOURS
+        )
+        await self.session.commit()
+
+        _verification_cooldowns[user.email] = now
+        self._send_verification_email(user)
+
+    def _send_verification_email(self, user: User) -> None:
+        verify_link = (
+            f"{settings.FRONTEND_URL}/#/verify-email?token={user.verification_token}"
+        )
+        send_email_background(
+            self.email_service.send_verification_email(
+                email=user.email,
+                first_name=user.first_name or "there",
+                verify_link=verify_link,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Login
+    # ------------------------------------------------------------------
+
+    async def login(
+        self,
+        request: LoginRequest,
+        ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> Tuple[User, str]:
         """Login user and return user + access token."""
         user = await self.user_repo.get_by_email(request.email)
         if not user or not verify_password(request.password, user.password_hash or ""):
             raise ValueError("Invalid credentials")
 
+        if user.auth_provider == "email" and not user.email_verified:
+            raise ValueError(
+                "Please verify your email address before signing in. "
+                "Check your inbox for the verification link, or request a new one."
+            )
+
         token = create_access_token(user.id)
+        await self._record_login(user, ip, user_agent)
         return user, token
+
+    # ------------------------------------------------------------------
+    # Google OAuth
+    # ------------------------------------------------------------------
+
+    async def login_with_google(
+        self,
+        id_token: str,
+        ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> Tuple[User, str]:
+        """Verify a Google ID token, create-or-login the user, return user + JWT."""
+        info = verify_google_id_token(id_token)
+        if info is None:
+            raise ValueError("Google sign-in failed. Please try again.")
+        return await self._authenticate_google_info(info, ip, user_agent)
+
+    async def login_with_google_redirect(
+        self,
+        info: dict,
+        ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> Tuple[User, str]:
+        """Same as login_with_google, but with claims from the redirect flow."""
+        return await self._authenticate_google_info(info, ip, user_agent)
+
+    async def _authenticate_google_info(
+        self,
+        info: dict,
+        ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> Tuple[User, str]:
+        google_id = str(info.get("sub") or "")
+        email = (info.get("email") or "").strip().lower()
+        if not google_id or not email:
+            raise ValueError("Google account is missing required profile information.")
+
+        # Existing users: match by email first, then by google_id.
+        user = await self.user_repo.get_by_email(email)
+        if user is None:
+            user = await self.user_repo.get_by_google_id(google_id)
+
+        if user is None:
+            # New Google user — auto-create a verified account.
+            full_name = (info.get("name") or "").strip()
+            name_parts = full_name.split(" ", 1)
+            user = User(
+                email=email,
+                google_id=google_id,
+                avatar_url=info.get("picture") or None,
+                first_name=info.get("given_name") or (name_parts[0] if name_parts else None),
+                last_name=info.get("family_name") or (name_parts[1] if len(name_parts) > 1 else None),
+                auth_provider="google",
+                email_verified=True,
+            )
+            user = await self.user_repo.create(user)
+        else:
+            # Existing user: link the Google identity and enrich the profile.
+            if not user.google_id:
+                user.google_id = google_id
+            if not user.avatar_url and info.get("picture"):
+                user.avatar_url = info.get("picture")
+            if user.auth_provider == "email":
+                # Google verified this address — unlock the account.
+                user.email_verified = True
+                user.verification_token = None
+                user.verification_expires_at = None
+            await self.session.commit()
+
+        token = create_access_token(user.id)
+        await self._record_login(user, ip, user_agent)
+        return user, token
+
+    # ------------------------------------------------------------------
+    # Login metadata + notification email
+    # ------------------------------------------------------------------
+
+    async def _record_login(
+        self,
+        user: User,
+        ip: Optional[str],
+        user_agent: Optional[str],
+    ) -> None:
+        """Persist last-login metadata and send a login-notification email."""
+        device_info = parse_user_agent(user_agent or "")
+
+        previous_device = user.last_login_device
+        previous_ip = user.last_login_ip
+        previous_login_at = user.last_login
+
+        user.last_login = datetime.utcnow()
+        user.last_login_ip = ip
+        user.last_login_device = device_info.get("device", "Desktop")
+        await self.session.commit()
+
+        if not settings.LOGIN_NOTIFICATION_ENABLED:
+            return
+
+        send_email_background(
+            self.email_service.send_login_notification(
+                email=user.email,
+                first_name=user.first_name or "Investor",
+                login_time=user.last_login,
+                ip=ip,
+                user_agent=user_agent or "",
+                previous_device=previous_device,
+                previous_ip=previous_ip,
+                previous_login_at=previous_login_at,
+            )
+        )
 
     async def get_current_user(self, user_id: str) -> Optional[User]:
         """Get user by ID."""
@@ -169,6 +371,25 @@ class AuthService:
         await self.session.commit()
 
         await self.reset_repo.delete(reset_token)
+
+    async def change_password(
+        self,
+        user_id: str,
+        current_password: str,
+        new_password: str,
+    ) -> None:
+        """Change a signed-in user's password (verifies the current password)."""
+        user = await self.user_repo.get_by_id(user_id)
+        if not user:
+            raise ValueError("User not found.")
+        if not user.password_hash:
+            raise ValueError(
+                "Your account uses Google sign-in and has no password to change."
+            )
+        if not verify_password(current_password, user.password_hash):
+            raise ValueError("Current password is incorrect.")
+        user.password_hash = hash_password(new_password)
+        await self.session.commit()
 
 
 class UserService:
@@ -721,18 +942,25 @@ class DocumentService:
         return chunks
 
     def _configure_embedding_client(self):
-        if settings.OPENAI_API_KEY:
+        api_key = (settings.OPENAI_API_KEY or "").strip()
+        router_key = (settings.OPENROUTER_API_KEY or "").strip()
+
+        # An OpenRouter key pasted into OPENAI_API_KEY (sk-or-...) must be
+        # routed to OpenRouter instead of OpenAI — otherwise embedding calls
+        # are rejected by platform.openai.com and documents never get indexed
+        # (which is why RAG retrievals found zero chunks).
+        if api_key and not is_openrouter_key(api_key):
             print("[documents] using OpenAI")
 
             return OpenAI(
-                api_key=settings.OPENAI_API_KEY,
+                api_key=api_key,
             )
 
-        if settings.OPENROUTER_API_KEY:
+        if router_key or (api_key and is_openrouter_key(api_key)):
             print("[documents] using OpenRouter")
 
             return OpenAI(
-                api_key=settings.OPENROUTER_API_KEY,
+                api_key=router_key or api_key,
                 base_url="https://openrouter.ai/api/v1",
             )
 
@@ -848,7 +1076,7 @@ class BookmarkService:
 
     async def create(
         self,
-        user_id: str,
+        user_id: uuid.UUID,
         kind: str,
         ref_id: str,
         title: Optional[str] = None,
@@ -857,7 +1085,9 @@ class BookmarkService:
         """Create bookmark."""
         bookmark = Bookmark(
             id=f"bm_{uuid.uuid4().hex[:8]}",
-            user_id=user_id,
+            # bookmarks.user_id is a UUID column; coerce so a str can never
+            # slip through and trigger another type mismatch.
+            user_id=uuid.UUID(str(user_id)),
             kind=kind,
             ref_id=ref_id,
             title=title,
@@ -865,9 +1095,9 @@ class BookmarkService:
         )
         return await self.bookmark_repo.create(bookmark)
 
-    async def delete(self, bookmark_id: str) -> bool:
-        """Delete bookmark."""
-        return await self.bookmark_repo.delete(bookmark_id)
+    async def delete_owned(self, bookmark_id: str, user_id: uuid.UUID) -> bool:
+        """Delete a bookmark only if it belongs to the given user."""
+        return await self.bookmark_repo.delete_owned(bookmark_id, user_id)
 
 
 class AIInsightService:
@@ -893,7 +1123,12 @@ class ChatService:
         self.conv_service = ConversationService(session)
         self.msg_service = MessageService(session)
 
-    async def chat(self, user_id: str, request: ChatRequest):
+    async def chat(
+        self,
+        user_id: str,
+        request: ChatRequest,
+        extra_context: Optional[str] = None,
+    ):
         """
         Process chat request using the production RAG pipeline.
 
@@ -902,6 +1137,11 @@ class ChatService:
           2. Prompt building with financial assistant system prompt
           3. OpenRouter LLM call with fallback models
           4. Message persistence
+
+        Args:
+            extra_context: Optional extra content (e.g. text extracted from an
+                uploaded image) that is injected into the prompt alongside the
+                retrieved document context.
 
         Returns:
             dict with conversation_id and content
@@ -915,6 +1155,7 @@ class ChatService:
             model=request.model or "openai/gpt-4o",
             company_id=request.company_id,
             conversation_id=request.conversation_id,
+            extra_context=extra_context,
         )
 
         return {

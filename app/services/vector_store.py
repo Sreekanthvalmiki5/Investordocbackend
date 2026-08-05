@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class VectorStoreService:
+    
     """
     DEPRECATED — This service is no longer used.
 

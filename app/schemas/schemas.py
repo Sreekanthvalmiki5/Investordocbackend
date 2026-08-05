@@ -81,6 +81,12 @@ class UserResponse(UserBase):
 
     id: UUID
     auth_provider: str
+    email_verified: bool = False
+    google_id: Optional[str] = None
+    avatar_url: Optional[str] = None
+    last_login: Optional[datetime] = None
+    last_login_ip: Optional[str] = None
+    last_login_device: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     role:str
@@ -465,6 +471,36 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     password: str = Field(..., min_length=8)
+
+
+class ChangePasswordRequest(BaseModel):
+    """Change the password of an authenticated user (verifies the current one)."""
+
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8)
+
+
+# ============================================================================
+# Google OAuth & Email Verification Schemas
+# ============================================================================
+
+
+class GoogleLoginRequest(BaseModel):
+    """Google ID token obtained from Google Identity Services (popup flow)."""
+
+    id_token: str = Field(..., min_length=1)
+
+
+class VerifyEmailRequest(BaseModel):
+    """Email verification token from the emailed link."""
+
+    token: str = Field(..., min_length=1)
+
+
+class ResendVerificationRequest(BaseModel):
+    """Request a fresh email-verification link."""
+
+    email: EmailStr
 
 
 # ============================================================================

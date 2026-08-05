@@ -5,6 +5,7 @@ Data access layer with SQLAlchemy async queries.
 
 from datetime import datetime
 from typing import List, Optional, Tuple
+from uuid import UUID
 
 from sqlalchemy import select, delete, func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +40,18 @@ class UserRepository:
     async def get_by_email(self, email: str) -> Optional[User]:
         """Get user by email."""
         stmt = select(User).where(User.email == email)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_by_google_id(self, google_id: str) -> Optional[User]:
+        """Get user by Google ID."""
+        stmt = select(User).where(User.google_id == google_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_by_verification_token(self, token: str) -> Optional[User]:
+        """Get user by email-verification token."""
+        stmt = select(User).where(User.verification_token == token)
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -606,6 +619,22 @@ class BookmarkRepository:
         await self.session.delete(bookmark)
         await self.session.commit()
         return True
+
+    async def delete_owned(self, bookmark_id: str, user_id: UUID) -> bool:
+        """
+        Delete a bookmark only if it belongs to the given user.
+
+        Single DELETE ... WHERE id AND user_id — the ownership check and the
+        delete happen atomically, so there is no check-then-delete race.
+        """
+        result = await self.session.execute(
+            delete(Bookmark).where(
+                Bookmark.id == bookmark_id,
+                Bookmark.user_id == user_id,
+            )
+        )
+        await self.session.commit()
+        return (result.rowcount or 0) > 0
 
     async def get_by_id(self, bookmark_id: str) -> Optional[Bookmark]:
         """Get bookmark by ID."""

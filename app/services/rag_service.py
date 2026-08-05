@@ -308,19 +308,38 @@ async def retrieve_context(
 def build_prompt(
     user_question: str,
     chunks: List[Dict[str, Any]],
+    extra_context: Optional[str] = None,
 ) -> Tuple[str, str, List[Dict[str, str]]]:
     """
     Build system prompt + user message with context.
 
+    Args:
+        extra_context: Optional text extracted from an uploaded image. Injected
+            into the prompt alongside the retrieved document context so answers
+            can combine both.
+
     Returns:
         Tuple of (system_prompt, formatted_user_message, messages_list)
     """
+    # Include extracted image content (tables / numbers / text) as an extra
+    # authoritative context block alongside the retrieved document chunks.
+    extra_block = ""
+    if extra_context and extra_context.strip():
+        extra_block = (
+            "\n\nAttached image content (extracted):\n"
+            f"{extra_context.strip()}\n"
+        )
+
     if not chunks:
+        context_body = "No relevant documents found."
+        if extra_block:
+            context_body += extra_block.rstrip()
         no_context_msg = (
             f"Question: {user_question}\n\n"
             "Context:\n"
-            "No relevant documents found.\n\n"
-            "Please inform the user that no relevant information was found."
+            f"{context_body}\n\n"
+            "Answer using the provided context. If the question cannot be "
+            "answered from it, tell the user no relevant information was found."
         )
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -357,7 +376,7 @@ def build_prompt(
         total_chars += len(entry)
 
     context_str = "\n".join(context_parts)
-    user_message = f"Question: {user_question}\n\n{context_str}"
+    user_message = f"Question: {user_question}\n\n{context_str}{extra_block}"
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -692,6 +711,7 @@ async def run_rag_pipeline(
     model: str,
     company_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    extra_context: Optional[str] = None,
 ) -> Tuple[str, str, str]:
     """
     Execute the full RAG pipeline end-to-end.
@@ -703,6 +723,8 @@ async def run_rag_pipeline(
         model: Requested LLM model
         company_id: Optional company filter
         conversation_id: Optional existing conversation ID
+        extra_context: Optional text extracted from an uploaded image, combined
+            with the retrieved document context in the prompt
 
     Returns:
         Tuple of (conversation_id, assistant_content, used_model)
@@ -753,7 +775,9 @@ async def run_rag_pipeline(
         logger.info("No relevant chunks found above threshold %.2f", SIMILARITY_THRESHOLD)
 
     # Step 4: Build prompt
-    system_prompt, user_msg_with_context, messages = build_prompt(message, chunks)
+    system_prompt, user_msg_with_context, messages = build_prompt(
+        message, chunks, extra_context=extra_context
+    )
     prompt_chars = sum(len(m["content"]) for m in messages)
     logger.info("Prompt length: %d characters across %d messages", prompt_chars, len(messages))
 
@@ -761,8 +785,9 @@ async def run_rag_pipeline(
     used_model = model if model in [PRIMARY_MODEL] + FALLBACK_MODELS else PRIMARY_MODEL
     answer = await call_openrouter(messages, used_model)
 
-    # If no context was found and answer doesn't mention it, prepend notice
-    if not chunks and "could not find" not in answer.lower():
+    # If no document context was found (and no image content either) and the
+    # answer doesn't mention it, prepend a notice.
+    if not chunks and not extra_context and "could not find" not in answer.lower():
         answer = (
             "I could not find relevant information in the uploaded documents.\n\n"
             f"{answer}"

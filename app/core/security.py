@@ -67,9 +67,6 @@ def create_access_token(
 
 def decode_token(token: str) -> Optional[str]:
     try:
-        print("JWT_SECRET_KEY:", settings.JWT_SECRET_KEY)
-        print("JWT_ALGORITHM:", settings.JWT_ALGORITHM)
-        print("TOKEN:", token)
 
         payload = jwt.decode(
             token,
@@ -77,7 +74,6 @@ def decode_token(token: str) -> Optional[str]:
             algorithms=[settings.JWT_ALGORITHM],
         )
 
-        print("PAYLOAD:", payload)
 
         return payload.get("sub")
 
