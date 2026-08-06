@@ -18,11 +18,21 @@ so answers combine image context with the retrieved document context.
 import asyncio
 import base64
 import logging
+import threading
 from typing import List, Optional
 
 from app.core.config import is_openrouter_key, settings
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Shared vision client (memory optimization)
+# ---------------------------------------------------------------------------
+# The OpenAI SDK builds a heavyweight HTTPX client on construction. Creating
+# one per image request would repeatedly allocate a connection pool and thread
+# pool. This lazy singleton is built once per process and reused.
+_vision_client = None
+_vision_client_lock = threading.Lock()
 
 AUDIO_EXTENSIONS = {"wav", "mp3", "m4a", "webm"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
@@ -54,27 +64,40 @@ VISION_SYSTEM_PROMPT = (
 
 
 def _get_vision_client():
-    """Vision-capable chat client — prefers OpenRouter (existing key), falls back to OpenAI."""
-    from openai import OpenAI
+    """Vision-capable chat client — prefers OpenRouter (existing key), falls back to OpenAI.
 
-    router_key = (settings.OPENROUTER_API_KEY or "").strip()
-    api_key = (settings.OPENAI_API_KEY or "").strip()
+    Cached lazy singleton: built once per process and reused by every image
+    request so the underlying HTTPX connection pool is not recreated per call.
+    """
+    global _vision_client
+    if _vision_client is not None:
+        return _vision_client
 
-    if router_key:
-        return OpenAI(
-            api_key=router_key,
-            base_url=settings.OPENROUTER_API_BASE,
-        )
-    if api_key and not is_openrouter_key(api_key):
-        return OpenAI(api_key=api_key)
-    if api_key:
-        # Only an OpenRouter key is configured (in OPENAI_API_KEY) — route it
-        # to OpenRouter instead of letting OpenAI reject it with a 401.
-        return OpenAI(
-            api_key=api_key,
-            base_url=settings.OPENROUTER_API_BASE,
-        )
-    return None
+    with _vision_client_lock:
+        if _vision_client is not None:
+            return _vision_client
+
+        from openai import OpenAI  # deferred import keeps module import light
+
+        router_key = (settings.OPENROUTER_API_KEY or "").strip()
+        api_key = (settings.OPENAI_API_KEY or "").strip()
+
+        if router_key:
+            _vision_client = OpenAI(
+                api_key=router_key,
+                base_url=settings.OPENROUTER_API_BASE,
+            )
+        elif api_key and not is_openrouter_key(api_key):
+            _vision_client = OpenAI(api_key=api_key)
+        elif api_key:
+            # Only an OpenRouter key is configured (in OPENAI_API_KEY) — route it
+            # to OpenRouter instead of letting OpenAI reject it with a 401.
+            _vision_client = OpenAI(
+                api_key=api_key,
+                base_url=settings.OPENROUTER_API_BASE,
+            )
+
+    return _vision_client
 
 
 # ---------------------------------------------------------------------------

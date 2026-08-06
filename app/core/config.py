@@ -85,7 +85,15 @@ class Settings(BaseSettings):
 
     # Speech-to-text (Faster-Whisper, fully local — no OpenAI key required)
     # Model sizes: tiny | base | small | medium | large-v3
-    WHISPER_MODEL: str = "small"
+    #
+    # Memory note (Render 512 MB free tier): the model is loaded lazily on the
+    # first voice request and kept in RAM afterwards. Approximate resident
+    # memory per size (int8): tiny ~75 MB, base ~145 MB, small ~460 MB,
+    # medium ~1.5 GB. Defaulting to "base" keeps transcription usable while
+    # leaving headroom for the app + DB pool inside 512 MB. Override with the
+    # WHISPER_MODEL env var if you need higher accuracy (e.g. "small" on the
+    # paid tier).
+    WHISPER_MODEL: str = "base"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "int8"
 

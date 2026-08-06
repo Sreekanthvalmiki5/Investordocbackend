@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import uuid
 from urllib.parse import urlparse
 
@@ -9,6 +10,18 @@ from app.core.config import settings
 
 
 class S3Service:
+    """
+    S3 wrapper with a process-wide shared boto3 client.
+
+    Memory optimization: boto3 client construction allocates a credential
+    chain, HTTP session and connection pool. Creating one per DocumentService
+    (which is instantiated per request and per scheduler tick) would waste
+    memory and CPU. The singleton below guarantees exactly one client per
+    process, reused everywhere.
+    """
+
+    _instance = None
+    _instance_lock = threading.Lock()
 
     def __init__(self):
         access_key = settings.AWS_ACCESS_KEY_ID or settings.AWS_ACCESS_KEY
@@ -26,6 +39,15 @@ class S3Service:
             aws_secret_access_key=secret_key,
             region_name=settings.AWS_REGION,
         )
+
+    @classmethod
+    def get_instance(cls) -> "S3Service":
+        """Return the process-wide singleton S3 service (client built once)."""
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
 
     @staticmethod
     def _resolve_key(value: str) -> str:

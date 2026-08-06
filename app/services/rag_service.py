@@ -14,12 +14,12 @@ Vector storage: Uses the `embedding_vector` column (pgvector Vector type) on the
 """
 
 import logging
+import threading
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from openai import OpenAI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +29,35 @@ logger = logging.getLogger(__name__)
 
 # Module-level cache for vector extension (checked once, then cached)
 _vector_extension_ready: bool = False
+
+# ---------------------------------------------------------------------------
+# Shared HTTP / OpenAI clients (memory optimization)
+#
+# The OpenAI SDK builds a heavyweight HTTPX client (connection pool, thread
+# pool) on construction. Creating one per embedding request would allocate
+# and tear down those pools repeatedly, wasting memory and CPU on Render's
+# 512 MB free tier. We therefore build each client exactly once per process
+# and reuse it (thread-safe lazy singletons).
+# ---------------------------------------------------------------------------
+_embedding_client = None
+_embedding_client_lock = threading.Lock()
+
+_openrouter_client: Optional[httpx.AsyncClient] = None
+_openrouter_client_lock = threading.Lock()
+
+
+def _get_openrouter_client() -> httpx.AsyncClient:
+    """Return the process-wide shared AsyncClient for OpenRouter calls."""
+    global _openrouter_client
+    if _openrouter_client is None:
+        with _openrouter_client_lock:
+            if _openrouter_client is None:
+                # Long timeout because OpenRouter can be slow on free models;
+                # the client lives for the whole process (never closed) so the
+                # connection pool is reused across requests instead of being
+                # recreated per call.
+                _openrouter_client = httpx.AsyncClient(timeout=120)
+    return _openrouter_client
 
 # ============================================================================
 # Constants
@@ -72,27 +101,44 @@ MAX_CONTEXT_CHARS = 12000  # Trim context to avoid exceeding model context windo
 # 1. Embedding Generation
 # ============================================================================
 
-def _get_embedding_client() -> Optional[OpenAI]:
+def _get_embedding_client() -> Optional[Any]:
     """
     Configure and return an OpenAI-compatible client for generating embeddings.
+
+    The client is created once and cached (lazy singleton) so repeated calls
+    reuse the same HTTPX connection pool instead of allocating a new client
+    (and its thread pool) on every embedding request.
 
     Priority:
     1. OpenAI API key (direct)
     2. OpenRouter API key (via OpenRouter's /v1/embeddings endpoint)
     """
-    if settings.OPENAI_API_KEY:
-        logger.info("Using OpenAI for embeddings")
-        return OpenAI(api_key=settings.OPENAI_API_KEY)
+    global _embedding_client
+    if _embedding_client is not None:
+        return _embedding_client
 
-    if settings.OPENROUTER_API_KEY:
-        logger.info("Using OpenRouter for embeddings")
-        return OpenAI(
-            api_key=settings.OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1",
-        )
+    with _embedding_client_lock:
+        if _embedding_client is not None:
+            return _embedding_client
 
-    logger.error("No API key configured for embeddings (set OPENAI_API_KEY or OPENROUTER_API_KEY)")
-    return None
+        from openai import OpenAI  # deferred import keeps module import light
+
+        if settings.OPENAI_API_KEY:
+            logger.info("Using OpenAI for embeddings")
+            _embedding_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        elif settings.OPENROUTER_API_KEY:
+            logger.info("Using OpenRouter for embeddings")
+            _embedding_client = OpenAI(
+                api_key=settings.OPENROUTER_API_KEY,
+                base_url="https://openrouter.ai/api/v1",
+            )
+        else:
+            logger.error(
+                "No API key configured for embeddings "
+                "(set OPENAI_API_KEY or OPENROUTER_API_KEY)"
+            )
+
+    return _embedding_client
 
 
 def generate_embedding(text: str) -> Optional[List[float]]:
@@ -442,8 +488,11 @@ async def call_openrouter(
         }
 
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+            # Reuse the process-wide client instead of building a fresh one
+            # (and a fresh connection pool) per model attempt.
+            resp = await _get_openrouter_client().post(
+                url, json=payload, headers=headers
+            )
 
             if resp.status_code == 429:
                 logger.warning("Rate limited on model %s, trying next", try_model)

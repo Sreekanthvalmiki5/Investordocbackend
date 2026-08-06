@@ -21,7 +21,6 @@ from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.logging import setup_logging
 from app.core.migrations import run_startup_migrations
 from app.services.services import DocumentService
-from app.services.transcription_service import TranscriptionService
 
 # Setup structured logging
 setup_logging()
@@ -43,25 +42,6 @@ async def _embedding_scheduler_loop(app: FastAPI):
         except Exception as exc:
             logger.error(f"Embedding scheduler error: {exc}", exc_info=exc)
         await asyncio.sleep(interval)
-
-
-async def _transcription_warmup(app: FastAPI):
-    """
-    Pre-load the Faster-Whisper model in the background at startup.
-
-    Runs off the event loop so startup is not blocked, and the model is ready
-    by the time the first voice request arrives (avoiding the download/load
-    cost — and the risk of hitting the frontend's upload timeout — on first
-    use). The singleton guarantees it is loaded exactly once.
-    """
-    try:
-        await asyncio.to_thread(TranscriptionService.get_instance()._load_model)
-        logger.info("Transcription model warm-up complete")
-    except Exception as exc:
-        logger.warning(
-            "Transcription model warm-up failed; it will load on first request: %s",
-            exc,
-        )
 
 
 async def _email_retry_loop(app: FastAPI):
@@ -179,15 +159,20 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # NOTE (memory optimization): No AI model is loaded here. The Faster-Whisper
+    # model (CTranslate2, ~500 MB in RAM) is loaded lazily on the FIRST voice
+    # request only (see TranscriptionService), so startup stays lightweight and
+    # the app fits Render's 512 MB free tier. The embedding scheduler below uses
+    # the OpenAI/OpenRouter HTTP API, not a local model, so it is safe to start
+    # at boot as well.
     app.state.embedding_scheduler_task = asyncio.create_task(_embedding_scheduler_loop(app))
     app.state.email_retry_task = asyncio.create_task(_email_retry_loop(app))
-    app.state.transcription_warmup = asyncio.create_task(_transcription_warmup(app))
     
     yield
     
     # Shutdown
     logger.info("Shutting down InvestorDocs AI Backend")
-    for task_name in ("embedding_scheduler_task", "email_retry_task", "transcription_warmup"):
+    for task_name in ("embedding_scheduler_task", "email_retry_task"):
         if hasattr(app.state, task_name):
             task = getattr(app.state, task_name)
             task.cancel()

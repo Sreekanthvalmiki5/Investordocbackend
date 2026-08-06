@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 # collected mid-send.
 _background_tasks: "set[asyncio.Task]" = set()
 
+# Shared HTTP client for IP geolocation (memory optimization). Building a fresh
+# AsyncClient (connection pool) for every login-notification lookup would waste
+# memory; one process-wide client is reused instead.
+_http_client: "Optional[httpx.AsyncClient]" = None
+_http_client_lock = asyncio.Lock()
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Return the process-wide shared AsyncClient (created once, never closed)."""
+    global _http_client
+    if _http_client is None:
+        async with _http_client_lock:
+            if _http_client is None:
+                _http_client = httpx.AsyncClient(timeout=3.0)
+    return _http_client
+
 # ---------------------------------------------------------------------------
 # Background email helper
 # ---------------------------------------------------------------------------
@@ -128,10 +144,10 @@ async def geolocate_ip(ip: str) -> Optional[Dict[str, str]]:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"http://ip-api.com/json/{ip}")
-            resp.raise_for_status()
-            data = resp.json()
+        # Reuse the process-wide client instead of creating a new one per call.
+        resp = await (await _get_http_client()).get(f"http://ip-api.com/json/{ip}")
+        resp.raise_for_status()
+        data = resp.json()
         if data.get("status") != "success":
             return None
         return {

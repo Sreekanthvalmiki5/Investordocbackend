@@ -1,20 +1,24 @@
 from typing import List, Optional, Dict, Any
 import logging
+import threading
 
-from langchain.schema import Document as LCDocument
-from langchain_huggingface import HuggingFaceEmbeddings
-
-from langchain_postgres import PGVector
-try:
-    from langchain_postgres import PGVector
-except Exception:
-    # graceful fallback if package not installed during static analysis
-    PGVector = None
+# NOTE (memory optimization): heavy AI imports (langchain, langchain_huggingface,
+# sentence-transformers, torch) are deliberately NOT imported at module level.
+# Importing HuggingFaceEmbeddings here would pull torch + sentence-transformers
+# into RAM for the entire process even though this deprecated service is never
+# used by the app. They are imported lazily inside the methods that need them.
 
 from app.core.config import settings
 
 
 logger = logging.getLogger(__name__)
+
+# Shared singleton embeddings instance: if this deprecated service is ever
+# re-enabled, all VectorStoreService instances share ONE HuggingFaceEmbeddings
+# object instead of each building their own model copy (~400 MB for
+# all-MiniLM-L6-v2).
+_shared_embeddings = None
+_shared_embeddings_lock = threading.Lock()
 
 
 class VectorStoreService:
@@ -39,14 +43,41 @@ class VectorStoreService:
     embedding_model or
     "sentence-transformers/all-MiniLM-L6-v2"
 )
-        self._embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
+        # Lazy: the model is only loaded when an embedding is actually needed,
+        # never during construction / module import.
+        self._embeddings = None
         self._vectorstore = None
 
+    def _get_embeddings(self):
+        """Lazily load the shared HuggingFaceEmbeddings instance (once per process)."""
+        global _shared_embeddings
+        if _shared_embeddings is None:
+            with _shared_embeddings_lock:
+                if _shared_embeddings is None:
+                    # Deferred import: torch / sentence-transformers are only
+                    # loaded when a vector operation actually runs.
+                    from langchain_huggingface import HuggingFaceEmbeddings
+
+                    _shared_embeddings = HuggingFaceEmbeddings(
+                        model_name=self.embedding_model
+                    )
+        self._embeddings = _shared_embeddings
+        return self._embeddings
 
     def init_vectorstore(self, collection_name: str = "investordocs") -> None:
         if self._vectorstore is None:
+            # Deferred import: langchain_postgres is only needed when the
+            # vectorstore is actually used (this service is deprecated).
+            try:
+                from langchain_postgres import PGVector
+            except Exception:
+                PGVector = None
+
+            if PGVector is None:
+                raise RuntimeError("PGVector backend not available")
+
             self._vectorstore = PGVector(
-                embeddings=self._embeddings,
+                embeddings=self._get_embeddings(),
                 connection=self.connection_string,
                 collection_name=collection_name,
                 use_jsonb=True,
@@ -67,10 +98,11 @@ class VectorStoreService:
         chunks: list of (chunk_text, page_number, chunk_index)
         Metadata stored per chunk: document_id, company_id, filename, report_type, year, quarter, page_number, chunk_index
         """
-        if PGVector is None:
-            raise RuntimeError("PGVector backend not available")
-
         self.init_vectorstore(collection_name=collection_name)
+
+        # Deferred import: langchain's Document class is small, but importing
+        # langchain at module level would drag in a large dependency tree.
+        from langchain.schema import Document as LCDocument
 
         docs = []
         for text, page_number, chunk_index in chunks:
@@ -106,6 +138,7 @@ class VectorStoreService:
 
     def similarity_search(self, query: str, k: int = 6, filter: Optional[dict] = None):
         self.init_vectorstore()
+        self._get_embeddings()  # ensure shared model is loaded before use
         if hasattr(self._vectorstore, "similarity_search"):
             return self._vectorstore.similarity_search(query, k=k, filter=filter or {})
         # fallback
@@ -115,6 +148,7 @@ class VectorStoreService:
 
     def get_retriever(self, search_kwargs: Optional[dict] = None):
         self.init_vectorstore()
+        self._get_embeddings()  # ensure shared model is loaded before use
         if hasattr(self._vectorstore, "as_retriever"):
             return self._vectorstore.as_retriever(search_kwargs=search_kwargs or {"k": 6})
         # If not available, return a tiny wrapper that calls similarity_search

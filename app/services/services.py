@@ -6,6 +6,7 @@ Business logic layer with repository injection.
 import asyncio
 import httpx
 import secrets
+import threading
 import uuid
 from datetime import datetime
 from io import BytesIO
@@ -13,7 +14,6 @@ from typing import List, Optional, Tuple
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
-from openai import OpenAI
 from fastapi import UploadFile
 from pypdf import PdfReader
 from sqlalchemy import text as sa_text
@@ -73,6 +73,15 @@ from app.core.security import create_access_token, hash_password, verify_passwor
 _verification_cooldowns: dict = {}
 _VERIFICATION_RESEND_COOLDOWN = timedelta(seconds=60)
 _VERIFICATION_COOLDOWN_MAX = 5000
+
+# ---------------------------------------------------------------------------
+# Shared OpenAI client (memory optimization)
+# ---------------------------------------------------------------------------
+# The OpenAI SDK wraps a heavyweight HTTPX client (connection + thread pools).
+# Building one per embedding call would repeatedly allocate/destroy those pools
+# and spike memory. This lazy singleton is created once and reused process-wide.
+_embedding_client = None
+_embedding_client_lock = threading.Lock()
 
 
 class AuthService:
@@ -641,7 +650,9 @@ class DocumentService:
 
     def __init__(self, session: AsyncSession):
         self.doc_repo = DocumentRepository(session)
-        self.s3 = S3Service()
+        # Shared singleton: the boto3 client (with its connection pool) is
+        # built once per process instead of once per request/scheduler tick.
+        self.s3 = S3Service.get_instance()
 
     async def get_pending_documents(self, limit: int = 50) -> List[Document]:
         """Get documents that still need embeddings."""
@@ -942,29 +953,38 @@ class DocumentService:
         return chunks
 
     def _configure_embedding_client(self):
-        api_key = (settings.OPENAI_API_KEY or "").strip()
-        router_key = (settings.OPENROUTER_API_KEY or "").strip()
+        # Cached lazy singleton: one OpenAI/OpenRouter client (and its HTTPX
+        # connection pool) per process, reused by every embedding call. This
+        # avoids allocating a new client for every document upload / scheduler
+        # tick, which would waste memory on Render's 512 MB tier.
+        global _embedding_client
+        if _embedding_client is not None:
+            return _embedding_client
 
-        # An OpenRouter key pasted into OPENAI_API_KEY (sk-or-...) must be
-        # routed to OpenRouter instead of OpenAI — otherwise embedding calls
-        # are rejected by platform.openai.com and documents never get indexed
-        # (which is why RAG retrievals found zero chunks).
-        if api_key and not is_openrouter_key(api_key):
-            print("[documents] using OpenAI")
+        with _embedding_client_lock:
+            if _embedding_client is not None:
+                return _embedding_client
 
-            return OpenAI(
-                api_key=api_key,
-            )
+            from openai import OpenAI  # deferred import keeps module import light
 
-        if router_key or (api_key and is_openrouter_key(api_key)):
-            print("[documents] using OpenRouter")
+            api_key = (settings.OPENAI_API_KEY or "").strip()
+            router_key = (settings.OPENROUTER_API_KEY or "").strip()
 
-            return OpenAI(
-                api_key=router_key or api_key,
-                base_url="https://openrouter.ai/api/v1",
-            )
+            # An OpenRouter key pasted into OPENAI_API_KEY (sk-or-...) must be
+            # routed to OpenRouter instead of OpenAI — otherwise embedding calls
+            # are rejected by platform.openai.com and documents never get indexed
+            # (which is why RAG retrievals found zero chunks).
+            if api_key and not is_openrouter_key(api_key):
+                print("[documents] using OpenAI")
+                _embedding_client = OpenAI(api_key=api_key)
+            elif router_key or (api_key and is_openrouter_key(api_key)):
+                print("[documents] using OpenRouter")
+                _embedding_client = OpenAI(
+                    api_key=router_key or api_key,
+                    base_url="https://openrouter.ai/api/v1",
+                )
 
-        return None
+        return _embedding_client
 
     def _create_embeddings(self, texts: list[str]) -> list[list[float]]:
         """
