@@ -4,9 +4,12 @@ Environment variables and settings management using Pydantic.
 """
 
 from typing import List
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic_settings import BaseSettings
 import os
+
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     """Application settings from environment variables."""
@@ -33,6 +36,21 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
     ]
+
+    # ------------------------------------------------------------------
+    # CORS: auto-allow the frontend origin
+    # ------------------------------------------------------------------
+    # The browser blocks cross-origin API calls unless the frontend origin is
+    # listed in allow_origins. Rather than hardcoding the production domain in
+    # the CORS_ORIGINS list above, FRONTEND_URL (set in the environment / .env)
+    # is merged in automatically. No trailing slash, no duplicates.
+    @model_validator(mode="after")
+    def _merge_frontend_origin(self) -> "Settings":
+        if self.FRONTEND_URL:
+            origin = self.FRONTEND_URL.strip().rstrip("/")
+            if origin and origin not in self.CORS_ORIGINS:
+                self.CORS_ORIGINS = [*self.CORS_ORIGINS, origin]
+        return self
 
     # Security
     PASSWORD_MIN_LENGTH: int = 8
@@ -107,6 +125,64 @@ class Settings(BaseSettings):
         env_file = ".env"
         case_sensitive = True
         extra = "ignore"
+
+    # ------------------------------------------------------------------
+    # URL normalization
+    # ------------------------------------------------------------------
+    # Render/Heroku/Neon expose DATABASE_URL as a bare `postgres://...` URL
+    # with no driver. SQLAlchemy then defaults to the SYNC psycopg2 dialect,
+    # which is not installed (and can never be used with create_async_engine).
+    # Force the asyncpg driver here so the async engine works out of the box.
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _normalize_database_url(cls, v: str) -> str:
+        v = _force_driver(v, "asyncpg")
+        # The SQLAlchemy asyncpg dialect does NOT understand sslmode=... (it
+        # forwards unknown query params straight to asyncpg.connect and crashes
+        # with "TypeError: connect() got an unexpected keyword argument
+        # 'sslmode'"). It expects ssl=... instead. Neon/Render URLs commonly
+        # carry ?sslmode=require, so translate it here.
+        return _rename_query_param(v, "sslmode", "ssl")
+
+    # Same idea for the vector-store connection: force the psycopg v3 driver
+    # (used by langchain_postgres.PGVector).
+    @field_validator("VECTOR_DB_URL")
+    @classmethod
+    def _normalize_vector_db_url(cls, v: str) -> str:
+        return _force_driver(v, "psycopg")
+
+
+def _force_driver(url: str, driver: str) -> str:
+    """Prefix a postgres URL with the given SQLAlchemy driver if missing."""
+    if url.startswith("postgresql://"):
+        return f"postgresql+{driver}://" + url[len("postgresql://"):]
+    if url.startswith("postgres://"):
+        return f"postgresql+{driver}://" + url[len("postgres://"):]
+    return url
+
+
+def _rename_query_param(url: str, old_key: str, new_key: str) -> str:
+    """Rename one query-string parameter (e.g. sslmode -> ssl).
+
+    If the new key is already present, the old key is dropped instead so a
+    leftover sslmode can never be forwarded to the asyncpg driver.
+    """
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    new_key_present = any(key == new_key for key, _ in query)
+    renamed = []
+    for key, value in query:
+        if key == old_key and not new_key_present:
+            renamed.append((new_key, value))
+        elif key != old_key:
+            renamed.append((key, value))
+    if renamed == query:
+        return url
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(renamed), parts.fragment)
+    )
 
 
 settings = Settings()
