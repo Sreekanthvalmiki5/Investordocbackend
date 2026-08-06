@@ -27,6 +27,38 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
+# SMTP auth / permanently-bad-address failures that retrying cannot fix.
+# Gmail returns 535 / "5.7.8 Username and Password not accepted" when the app
+# password is wrong or revoked. Retrying those every 10 minutes just burns
+# log noise and outbox rows, so they are marked failed immediately instead.
+_PERMANENT_SMTP_ERROR_MARKERS = (
+    "5.7.8",
+    "username and password not accepted",
+    "authentication failed",
+    "invalid credentials",
+)
+
+
+def _is_permanent_smtp_failure(exc: Exception) -> bool:
+    """
+    True when the SMTP error is permanent (bad credentials, invalid recipient).
+
+    Transient errors (timeouts, connection refused, 4xx temporary rejects)
+    return False so the retry scheduler keeps trying them.
+    """
+    code = getattr(exc, "code", None)
+    if code is not None:
+        # Per the SMTP spec, 4xx (and lower) responses are transient and must
+        # be retried -- even if their message text happens to mention auth
+        # (e.g. 454 "temporary authentication failure").
+        if code < 500:
+            return False
+        if code == 535:
+            return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _PERMANENT_SMTP_ERROR_MARKERS)
+
+
 async def _embedding_scheduler_loop(app: FastAPI):
     interval = 1800  # 30 minutes
     logger.info(f"Embedding scheduler started, running every {interval} seconds")
@@ -97,6 +129,20 @@ async def _email_retry_loop(app: FastAPI):
                     except Exception as exc:
                         row.attempts += 1
                         row.last_error = str(exc)[:1000]
+                        if _is_permanent_smtp_failure(exc):
+                            # Bad credentials / invalid recipient: retrying
+                            # cannot fix this, so fail the email immediately
+                            # with an actionable message.
+                            row.status = "failed"
+                            logger.error(
+                                "Email permanently failed (%s -> %s): %s. "
+                                "Check SMTP_PASSWORD / SMTP_EMAIL in .env and "
+                                "restart the server.",
+                                row.email_type,
+                                row.recipient,
+                                exc,
+                            )
+                            continue
                         # Password-reset links expire after 30 minutes, so cap
                         # their retries (max ~20 min of delay) to avoid
                         # delivering an already-expired link.
