@@ -23,7 +23,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.config import is_openrouter_key, settings
 
 logger = logging.getLogger(__name__)
 
@@ -110,8 +110,13 @@ def _get_embedding_client() -> Optional[Any]:
     (and its thread pool) on every embedding request.
 
     Priority:
-    1. OpenAI API key (direct)
-    2. OpenRouter API key (via OpenRouter's /v1/embeddings endpoint)
+    1. A genuine OpenAI key in OPENAI_API_KEY (direct)
+    2. An OpenRouter key -- whether in OPENROUTER_API_KEY or accidentally
+       pasted into OPENAI_API_KEY (sk-or-...) -- routed to OpenRouter's
+       /v1/embeddings endpoint. Sending an OpenRouter key to api.openai.com
+       is rejected with 401, which is exactly what happened for query
+       embeddings while document embeddings (which already used this routing)
+       succeeded.
     """
     global _embedding_client
     if _embedding_client is not None:
@@ -123,14 +128,17 @@ def _get_embedding_client() -> Optional[Any]:
 
         from openai import OpenAI  # deferred import keeps module import light
 
-        if settings.OPENAI_API_KEY:
+        api_key = (settings.OPENAI_API_KEY or "").strip()
+        router_key = (settings.OPENROUTER_API_KEY or "").strip()
+
+        if api_key and not is_openrouter_key(api_key):
             logger.info("Using OpenAI for embeddings")
-            _embedding_client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        elif settings.OPENROUTER_API_KEY:
+            _embedding_client = OpenAI(api_key=api_key)
+        elif router_key or (api_key and is_openrouter_key(api_key)):
             logger.info("Using OpenRouter for embeddings")
             _embedding_client = OpenAI(
-                api_key=settings.OPENROUTER_API_KEY,
-                base_url="https://openrouter.ai/api/v1",
+                api_key=router_key or api_key,
+                base_url=settings.OPENROUTER_API_BASE.rstrip("/"),
             )
         else:
             logger.error(
