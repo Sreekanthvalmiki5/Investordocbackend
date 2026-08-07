@@ -265,9 +265,17 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+@app.head("/health", include_in_schema=False)
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Health check endpoint."""
+    """
+    Health check endpoint (no auth required).
+
+    Serves both GET and HEAD because uptime monitors (UptimeRobot, Better
+    Stack, Pingdom, ...) often probe with HEAD requests, which a GET-only
+    route rejects with 405. HEAD is hidden from the OpenAPI docs to avoid a
+    duplicate operation ID.
+    """
     return {"status": "healthy", "service": "InvestorDocs AI Backend"}
 
 
